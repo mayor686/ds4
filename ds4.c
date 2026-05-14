@@ -1437,7 +1437,13 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 
     const double t0 = now_sec();
     uint64_t cached = 0;
+#ifdef __HIP_PLATFORM_AMD__
+    if (!g_mgpu_ctx) {
+        if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    }
+#else
     if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+#endif
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
