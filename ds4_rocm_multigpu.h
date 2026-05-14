@@ -1,7 +1,6 @@
 #pragma once
 
-#include "ds4_rocm.h"
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <stdio.h>
 #include <stdlib.h>
 

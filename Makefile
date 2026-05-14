@@ -29,7 +29,7 @@ ROCM_ARCH ?= gfx1151
 GPU_CFLAGS ?= -O3 -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 GPU_LDLIBS = -lm -pthread -L$(ROCM_PATH)/lib -lhipblas
 
-CFLAGS += -D__HIP_PLATFORM_AMD__
+CFLAGS += -D__HIP_PLATFORM_AMD__ -I$(ROCM_PATH)/include
 
 @echo "ROCM_ARCH: $(ROCM_ARCH)"
 
