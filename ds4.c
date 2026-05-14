@@ -43,6 +43,11 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef __HIP_PLATFORM_AMD__
+#include "ds4_rocm_multigpu.h"
+static ds4_rocm_mgpu_context_t* g_mgpu_ctx = NULL;
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -7629,12 +7634,22 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_mgpu_ctx) {
+            hipSetDevice(ds4_rocm_mgpu_get_layer_device(il, DS4_N_LAYER, g_mgpu_ctx));
+        }
+#endif
         layer_forward_raw_swa_one(next, model, &weights->layer[il], &cache->layer[il],
                                   cur, il, pos, token,
                                   steering_dirs,
                                   steering_attn_scale,
                                   steering_ffn_scale,
                                   scratch);
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_mgpu_ctx) {
+            ds4_rocm_mgpu_pipeline_transfer(next, il, next, DS4_N_LAYER, DS4_N_HC * DS4_N_EMBD * sizeof(float), g_mgpu_ctx);
+        }
+#endif
         float *tmp = cur;
         cur = next;
         next = tmp;
@@ -7707,6 +7722,11 @@ static void prefill_layer_major_cpu(
     free(plain);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_mgpu_ctx) {
+            hipSetDevice(ds4_rocm_mgpu_get_layer_device(il, DS4_N_LAYER, g_mgpu_ctx));
+        }
+#endif
         fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
         fflush(stderr);
 
@@ -7817,6 +7837,12 @@ static void prefill_layer_major_cpu(
         float *tmp = cur;
         cur = next;
         next = tmp;
+
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_mgpu_ctx) {
+            ds4_rocm_mgpu_pipeline_transfer(cur, il, cur, DS4_N_LAYER, n_tok * hc_dim * sizeof(float), g_mgpu_ctx);
+        }
+#endif
     }
 
     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
@@ -16948,6 +16974,11 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+#ifdef __HIP_PLATFORM_AMD__
+    if (!g_mgpu_ctx) {
+        g_mgpu_ctx = ds4_rocm_mgpu_init();
+    }
+#endif
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -17076,6 +17107,12 @@ void ds4_engine_summary(ds4_engine *e) {
 }
 
 void ds4_engine_close(ds4_engine *e) {
+#ifdef __HIP_PLATFORM_AMD__
+    if (g_mgpu_ctx) {
+        ds4_rocm_mgpu_free(g_mgpu_ctx);
+        g_mgpu_ctx = NULL;
+    }
+#endif
     if (!e) return;
     weights_free(&e->weights);
     vocab_free(&e->vocab);
