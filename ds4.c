@@ -1437,13 +1437,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 
     const double t0 = now_sec();
     uint64_t cached = 0;
-#ifdef __HIP_PLATFORM_AMD__
-    if (!g_mgpu_ctx) {
-        if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
-    }
-#else
     if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
-#endif
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -11011,6 +11005,12 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
+#ifdef __HIP_PLATFORM_AMD__
+    if (g_mgpu_ctx) {
+        hipSetDevice(ds4_rocm_mgpu_get_layer_device(il, DS4_N_LAYER, g_mgpu_ctx));
+    }
+#endif
+
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -12329,6 +12329,12 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+
+#ifdef __HIP_PLATFORM_AMD__
+    if (g_mgpu_ctx) {
+        hipSetDevice(ds4_rocm_mgpu_get_layer_device(il, DS4_N_LAYER, g_mgpu_ctx));
+    }
+#endif
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
