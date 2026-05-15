@@ -1034,21 +1034,10 @@ static const char *cuda_model_range_ptr_from_fd(
     if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
 
     uint64_t copied = 0;
-    uint64_t chunk_idx = 0;
     while (copied < bytes) {
         const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
-        const uint64_t bi = chunk_idx % 4u;
-        if (chunk_idx >= 4u) {
-            err = cudaEventSynchronize(g_model_stage_event[bi]);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
-                        what ? what : "weights", cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return NULL;
-            }
-        }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+        if (!cuda_model_stage_read(g_model_stage[0], g_model_stage_bytes,
                                    offset + copied, n, &payload)) {
             fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
@@ -1056,8 +1045,14 @@ static const char *cuda_model_range_ptr_from_fd(
                     strerror(errno));
             return NULL;
         }
+        
+#ifdef __HIP_PLATFORM_AMD__
+        err = cudaMemcpy(dev + copied, payload, (size_t)n, cudaMemcpyHostToDevice);
+#else
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
+        cudaStreamSynchronize(g_model_upload_stream);
+#endif
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
@@ -1066,25 +1061,10 @@ static const char *cuda_model_range_ptr_from_fd(
             (void)cudaGetLastError();
             return NULL;
         }
-        err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
-                    what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
-        }
         cuda_model_drop_file_pages(offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
-        chunk_idx++;
-    }
-    err = cudaStreamSynchronize(g_model_upload_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
-                what ? what : "weights", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return NULL;
     }
 
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
@@ -1302,7 +1282,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
+    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes, cudaMemAttachGlobal), "tensor alloc managed")) {
         free(t);
         return NULL;
     }
