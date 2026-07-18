@@ -300,6 +300,15 @@ applies the same routed-prefill headroom before sizing the dynamic cache. Leave
 the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` only for measurements.
 
+The six-gfx906 PP6 example includes two self-contained profiles. Edit
+`MODEL_PATH` inside the selected file and run it directly; no launch-time
+environment variables are required:
+
+```sh
+./run-speed.sh    # resident weights, 300K context, maximum throughput
+./run-context.sh  # 2GB expert cache per GPU, native 1M context
+```
+
 ### Practical SSD streaming examples
 
 On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
