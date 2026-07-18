@@ -388,6 +388,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#if !defined(DS4_GFX906)
         if (!g_quality_mode && (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
@@ -405,6 +406,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     blocks * 34u);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
         }
+#endif
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;

@@ -85,9 +85,11 @@ __global__ static void router_select_warp_topk_kernel(
         }
         #pragma unroll
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
-            const float other_score = __shfl_xor_sync(FULL_WARP_MASK, best_score, mask);
-            const float other_prob = __shfl_xor_sync(FULL_WARP_MASK, best_prob, mask);
-            const uint32_t other_idx = __shfl_xor_sync(FULL_WARP_MASK, best_idx, mask);
+            const uint32_t lane_abs = threadIdx.y * blockDim.x + threadIdx.x;
+            const MASK_T row_mask = ds4_subgroup_mask(lane_abs, 32u);
+            const float other_score = __shfl_xor_sync(row_mask, best_score, mask);
+            const float other_prob = __shfl_xor_sync(row_mask, best_prob, mask);
+            const uint32_t other_idx = __shfl_xor_sync(row_mask, best_idx, mask);
             if (router_score_better(other_score, other_idx, best_score, best_idx)) {
                 best_score = other_score;
                 best_prob = other_prob;

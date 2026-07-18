@@ -1550,9 +1550,9 @@ static int cuda_stream_resident_make_room(
 
     size_t free_b = 0;
     size_t total_b = 0;
-    const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
     while (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-        (void)total_b;
+        const uint64_t reserve =
+            cuda_stream_resident_free_reserve_bytes((uint64_t)total_b);
         if ((uint64_t)free_b >= reserve &&
             bytes <= (uint64_t)free_b - reserve) {
             return 1;
@@ -4864,7 +4864,7 @@ static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     if (g_ssd_streaming_mode) {
-        return cuda_stream_resident_free_reserve_bytes();
+        return cuda_stream_resident_free_reserve_bytes(total_bytes);
     }
     if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
         return 512ull * 1048576ull;
@@ -5506,7 +5506,21 @@ static int cuda_stream_model_cache_prepare_memory(
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
+    uint64_t mb = 1792;
+    const char *env = getenv("DS4_ROCM_WEIGHT_ARENA_CHUNK_MB");
+    if (!env || !env[0]) env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0) mb = (uint64_t)v;
+    }
+    if (mb < 256) mb = 256;
+    if (mb > 8192) mb = 8192;
+    uint64_t bytes = mb * 1048576ull;
+    if (need > bytes / 2u) {
+        const uint64_t align = 64ull * 1048576ull;
+        return (need + align - 1u) & ~(align - 1u);
+    }
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -5662,6 +5676,15 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
+    if (cuda_stream_cache_stats_on()) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "model arena map %-18s off=%.3f GiB bytes=%.2f MiB total=%.2f GiB ranges=%zu\n",
+                what ? what : "weights",
+                (double)offset / 1073741824.0,
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0,
+                g_model_ranges.size());
+    }
     cuda_model_load_progress_note(g_model_range_bytes);
     return (const char *)dev;
 }

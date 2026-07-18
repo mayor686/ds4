@@ -3002,7 +3002,8 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
-                                            uint32_t span_count) {
+                                            uint32_t span_count,
+                                            bool spans_preinstalled) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 #ifndef DS4_ROCM_BUILD
@@ -3013,8 +3014,13 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 
     const double t0 = now_sec();
     uint64_t prepared = 0;
-    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
-        return false;
+    if (spans_preinstalled) {
+        for (uint32_t i = 0; i < span_count; i++) prepared += span_sizes[i];
+    } else {
+        if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes,
+                                                    span_count, &prepared)) {
+            return false;
+        }
     }
     if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
     const double t1 = now_sec();
@@ -3024,8 +3030,11 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     const char *accelerator_name = "CUDA";
 #endif
     fprintf(stderr,
-            "ds4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
-            accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
+            "ds4: %s startup model preparation %s %.2f GiB of tensor spans in %.3fs\n",
+            accelerator_name,
+            spans_preinstalled ? "reused preinstalled" : "covered",
+            (double)prepared / 1073741824.0,
+            t1 - t0);
     return true;
 }
 #else
@@ -3033,12 +3042,14 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
-                                            uint32_t span_count) {
+                                            uint32_t span_count,
+                                            bool spans_preinstalled) {
     (void)backend;
     (void)m;
     (void)span_offsets;
     (void)span_sizes;
     (void)span_count;
+    (void)spans_preinstalled;
     return true;
 }
 #endif
@@ -17741,10 +17752,12 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
         uint32_t             n_tokens) {
+    const ds4_layer_weights *shape_layer =
+        weights ? weights_first_bound_layer(weights) : NULL;
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
-        !weights ||
+        !shape_layer ||
         n_tokens <= 1 ||
         glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
                               "DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") ||
@@ -56295,7 +56308,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
-                                             load_span_count)) {
+                                             load_span_count,
+                                             e->ssd_streaming)) {
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
             free(load_offsets);
@@ -57918,6 +57932,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         layer_start == 0 &&
         (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
          metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
+    if (g->ssd_streaming && getenv("DS4_ROCM_STREAM_CACHE_STATS") != NULL) {
+        fprintf(stderr,
+                "ds4: ROCm layer-slice streaming map mode=%s layers=%u:%u tokens=%u "
+                "cache_experts=%u quality=%d input_hc=%d\n",
+                batch_selected_addr ? "selected-address" : "full-layer",
+                layer_start,
+                layer_end,
+                n_tokens,
+                ds4_gpu_stream_expert_cache_configured_count(),
+                g->quality ? 1 : 0,
+                input_hc ? 1 : 0);
+    }
     if (g->ssd_streaming) {
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             g->streaming_static_decode_map_current = false;
