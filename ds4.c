@@ -14977,6 +14977,11 @@ typedef struct {
     uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
     bool spec_capture_prefix1;
+    /* A distributed graph owns persistent KV state only for its local
+     * transformer slice.  Ordinary and tensor-parallel graphs keep the full
+     * range, so existing single-process allocation remains unchanged. */
+    uint32_t cache_layer_start;
+    uint32_t cache_layer_end;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -16024,13 +16029,17 @@ static bool metal_graph_configure_dspark_capture(
     return true;
 }
 
-static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
-    uint64_t bytes = (uint64_t)DS4_N_LAYER *
+static uint64_t metal_graph_kv_cache_bytes_for_context(
+        uint32_t ctx_size,
+        uint32_t raw_cap,
+        uint32_t layer_start,
+        uint32_t layer_end) {
+    uint64_t bytes = (uint64_t)(layer_end - layer_start + 1u) *
                      raw_cap *
                      DS4_N_HEAD_DIM *
                      sizeof(float);
 
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
@@ -16047,16 +16056,19 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
         uint32_t  ctx_size,
         uint32_t  raw_cap,
         uint32_t  prefill_cap,
+        uint32_t  layer_start,
+        uint32_t  layer_end,
         uint64_t *kv_cache_bytes_out) {
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     uint64_t comp_cap = (uint64_t)(ctx_size / min_ratio + 2u);
     if (comp_cap < 2u) comp_cap = 2u;
-    const uint64_t kv_cache_bytes = metal_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
+    const uint64_t kv_cache_bytes = metal_graph_kv_cache_bytes_for_context(
+            ctx_size, raw_cap, layer_start, layer_end);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
@@ -16779,10 +16791,18 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp,
         const int              *placement,
         bool                    cuda_tensor_parallel,
-        const ds4_gpu_graph    *shared_prefill_workspace) {
+        const ds4_gpu_graph    *shared_prefill_workspace,
+        uint32_t                cache_layer_start,
+        uint32_t                cache_layer_end) {
+    if (cache_layer_start > cache_layer_end ||
+        cache_layer_end >= (uint32_t)DS4_N_LAYER) {
+        return false;
+    }
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
+    g->cache_layer_start = cache_layer_start;
+    g->cache_layer_end = cache_layer_end;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -16871,7 +16891,7 @@ static bool metal_graph_alloc_raw_cap(
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = cache_layer_start; il <= cache_layer_end; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
@@ -16883,7 +16903,7 @@ static bool metal_graph_alloc_raw_cap(
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = cache_layer_start; il <= cache_layer_end; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) {
             g->layer_comp_cap[il] = 0;
             continue;
@@ -16917,7 +16937,9 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t pc = prefill_cap;
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
-        metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
+        metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap,
+                                                cache_layer_start, cache_layer_end,
+                                                &kv_cache_bytes);
     const bool managed_kv_cache =
         ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
     if (managed_kv_cache) {
@@ -16995,7 +17017,7 @@ static bool metal_graph_alloc_raw_cap(
         g->kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     }
     bool state_init_ok = true;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = cache_layer_start; il <= cache_layer_end; il++) {
         /* A distributed process owns only its bound layer slice. Persistent
          * KV state must follow that ownership just like the model tensors;
          * allocating every model layer here defeats split-model residency. */
@@ -17294,7 +17316,9 @@ static bool metal_graph_alloc_raw_cap(
     }
 
     bool layer_cache_ok = true;
-    for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = cache_layer_start;
+         layer_cache_ok && il <= cache_layer_end;
+         il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         if (layer_cache_ok && g->cuda_tp_attn_cache_dup) {
@@ -17404,7 +17428,8 @@ static bool metal_graph_alloc(
     /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
     return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
-                                     1, false, NULL, false, NULL);
+                                     1, false, NULL, false, NULL,
+                                     0, DS4_N_LAYER - 1u);
 }
 
 static bool metal_graph_install_model_spans(
@@ -17752,12 +17777,10 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
         uint32_t             n_tokens) {
-    const ds4_layer_weights *shape_layer =
-        weights ? weights_first_bound_layer(weights) : NULL;
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
-        !shape_layer ||
+        !weights ||
         n_tokens <= 1 ||
         glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
                               "DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") ||
@@ -17770,12 +17793,18 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         DS4_N_LAYER == 0) {
         return false;
     }
-    const uint32_t routed_il =
-        DS4_N_LEADING_DENSE < DS4_N_LAYER ? DS4_N_LEADING_DENSE : 0u;
-    const ds4_layer_weights *layer = &weights->layer[routed_il];
-    if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) {
-        return false;
+    const ds4_layer_weights *layer = NULL;
+    uint32_t routed_il = g->cache_layer_start;
+    if (routed_il < DS4_N_LEADING_DENSE) routed_il = DS4_N_LEADING_DENSE;
+    for (; routed_il <= g->cache_layer_end; routed_il++) {
+        const ds4_layer_weights *candidate = &weights->layer[routed_il];
+        if (candidate->ffn_gate_exps && candidate->ffn_up_exps &&
+            candidate->ffn_down_exps) {
+            layer = candidate;
+            break;
+        }
     }
+    if (!layer) return false;
 #ifdef DS4_ROCM_BUILD
     const bool selected_iq2 =
         glm_stream_selected_expert_cache_supported(layer, routed_il);
@@ -17839,7 +17868,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         return false;
     }
 
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = g->cache_layer_start; il <= g->cache_layer_end; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
         if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
             !layer->ffn_down_exps) {
@@ -32672,7 +32701,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = g->cache_layer_start; il <= g->cache_layer_end; il++) {
         if (!g->layer_raw_cache[il]) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -35057,7 +35086,8 @@ static int metal_graph_prompt_logits_test(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        (uint32_t)n_test, false, NULL, false, NULL);
+                                        (uint32_t)n_test, false, NULL, false, NULL,
+                                        0, DS4_N_LAYER - 1u);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -46887,7 +46917,8 @@ static int generate_metal_graph_raw_swa(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, false, NULL, false, NULL,
+                                        0, DS4_N_LAYER - 1u);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -50685,7 +50716,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, false, NULL, false, NULL,
+                                        0, DS4_N_LAYER - 1u);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -56936,13 +56968,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         e->shared_prefill_workspace_ready
             ? &e->shared_prefill_workspace
             : NULL;
+    uint32_t cache_layer_start = 0;
+    uint32_t cache_layer_end = DS4_N_LAYER - 1u;
+    if (e->distributed.role != DS4_DISTRIBUTED_NONE &&
+        e->distributed.layers.set) {
+        cache_layer_start = e->distributed.layers.start;
+        cache_layer_end = e->distributed.layers.end;
+    }
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    need_spec_verifier,
                                    placement,
                                    e->cuda_tensor_parallel,
-                                   shared_prefill_workspace))
+                                   shared_prefill_workspace,
+                                   cache_layer_start,
+                                   cache_layer_end))
     {
         free(s);
         return 1;
@@ -57929,7 +57970,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     const int src_tier = g->active_tier;
     const bool batch_selected_addr =
         g->ssd_streaming &&
-        layer_start == 0 &&
         (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
          metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
     if (g->ssd_streaming && getenv("DS4_ROCM_STREAM_CACHE_STATS") != NULL) {
