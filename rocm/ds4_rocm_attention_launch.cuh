@@ -60,7 +60,25 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     if (cfg->oldhip_attention_decode) {
         const uint32_t rows = n_raw + n_comp;
         const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);
-        attention_decode_mixed_one_fast_oldhip_kernel<<<(unsigned)n_head, 256, shmem>>>(
+#if defined(DS4_GFX906)
+        /* Cooperative rows coalesce the score-dot loads and win for the
+         * short decode shapes.  Once the cache grows, shuffle overhead
+         * outweighs that benefit; keep the scalar-per-row path for long
+         * contexts (8,228 rows measured 7.7% faster on Vega 20). */
+        if (cfg->attention_cooperative_dot && rows <= 1024u)
+            attention_decode_mixed_one_fast_oldhip_kernel<true><<<
+                    (unsigned)n_head, 256, shmem>>>(
+                (float *)heads->ptr,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : NULL,
+                use_mask ? (const float *)comp_mask->ptr : NULL,
+                sinks, n_raw, raw_cap, raw_start, n_comp, use_mask,
+                n_head, head_dim, (uint32_t)((head_dim & 3u) == 0u));
+        else
+#endif
+        attention_decode_mixed_one_fast_oldhip_kernel<false><<<
+                (unsigned)n_head, 256, shmem>>>(
                 (float *)heads->ptr,
                 (const float *)q->ptr,
                 (const float *)raw_kv->ptr,

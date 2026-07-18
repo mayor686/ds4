@@ -15,6 +15,14 @@
 #include "rocm/ds4_rocm_common.cuh"
 #include "rocm/ds4_rocm_q8.cuh"
 
+enum {
+    DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_MAX_N_EXPERT = 384u,
+    DS4_ROCM_N_EXPERT_USED = 6u
+};
+#define DS4_ROCM_ROUTER_KERNEL_ONLY
+#include "rocm/ds4_rocm_router.cuh"
+
 #define MTILES 8
 #define NB 4  // 4 B fragments per wave like the MoE gate_up_mid kernel (bg0,bu0,bg1,bu1)
 
@@ -197,6 +205,78 @@ static bool test_f16_pair_workgroup_sizing() {
     return ok && mismatches == 0;
 }
 
+template <uint32_t N_EXPERT>
+static bool test_router_wave64() {
+    std::vector<float> hlogits(N_EXPERT), hbias(N_EXPERT);
+    std::vector<int32_t> href_sel(DS4_ROCM_N_EXPERT_USED), h_sel(DS4_ROCM_N_EXPERT_USED);
+    std::vector<float> href_weights(DS4_ROCM_N_EXPERT_USED), h_weights(DS4_ROCM_N_EXPERT_USED);
+    std::vector<float> href_probs(N_EXPERT), h_probs(N_EXPERT);
+    for (uint32_t i = 0; i < N_EXPERT; i++) {
+        hlogits[i] = (float)((int)((i * 17u) % 101u) - 50) / 9.0f;
+        hbias[i] = (float)((int)((i * 7u) % 31u) - 15) / 100.0f;
+    }
+    /* Deliberate equal scores exercise the expert-index tie break. */
+    hlogits[3] = hlogits[131] = 4.0f;
+    hbias[3] = hbias[131] = 0.25f;
+
+    float *dlogits = nullptr, *dbias = nullptr, *dweights = nullptr, *dprobs = nullptr;
+    int32_t *dselected = nullptr;
+    const bool allocated =
+        hip_ok(hipMalloc(&dlogits, hlogits.size() * sizeof(float)), "router malloc logits") &&
+        hip_ok(hipMalloc(&dbias, hbias.size() * sizeof(float)), "router malloc bias") &&
+        hip_ok(hipMalloc(&dselected, h_sel.size() * sizeof(int32_t)), "router malloc selected") &&
+        hip_ok(hipMalloc(&dweights, h_weights.size() * sizeof(float)), "router malloc weights") &&
+        hip_ok(hipMalloc(&dprobs, h_probs.size() * sizeof(float)), "router malloc probs");
+    if (!allocated) {
+        (void)hipFree(dprobs); (void)hipFree(dweights); (void)hipFree(dselected);
+        (void)hipFree(dbias); (void)hipFree(dlogits);
+        return false;
+    }
+    bool ok =
+        hip_ok(hipMemcpy(dlogits, hlogits.data(), hlogits.size() * sizeof(float), hipMemcpyHostToDevice),
+               "router copy logits") &&
+        hip_ok(hipMemcpy(dbias, hbias.data(), hbias.size() * sizeof(float), hipMemcpyHostToDevice),
+               "router copy bias");
+    if (ok) {
+        router_select_warp_topk_kernel<N_EXPERT, 32u><<<1, dim3(32, 4, 1)>>>(
+            dselected, dweights, dprobs, dbias, nullptr, dlogits, nullptr, 0,
+            0, 1, 1.5f, 1, 0);
+        ok = hip_ok(hipDeviceSynchronize(), "router wave32 launch") &&
+             hip_ok(hipMemcpy(href_sel.data(), dselected, href_sel.size() * sizeof(int32_t),
+                              hipMemcpyDeviceToHost), "router copy selected reference") &&
+             hip_ok(hipMemcpy(href_weights.data(), dweights, href_weights.size() * sizeof(float),
+                              hipMemcpyDeviceToHost), "router copy weights reference") &&
+             hip_ok(hipMemcpy(href_probs.data(), dprobs, href_probs.size() * sizeof(float),
+                              hipMemcpyDeviceToHost), "router copy probs reference");
+    }
+    if (ok) {
+        router_select_warp_topk_kernel<N_EXPERT, 64u><<<1, dim3(64, 1, 1)>>>(
+            dselected, dweights, dprobs, dbias, nullptr, dlogits, nullptr, 0,
+            0, 1, 1.5f, 1, 0);
+        ok = hip_ok(hipDeviceSynchronize(), "router wave64 launch") &&
+             hip_ok(hipMemcpy(h_sel.data(), dselected, h_sel.size() * sizeof(int32_t),
+                              hipMemcpyDeviceToHost), "router copy selected wave64") &&
+             hip_ok(hipMemcpy(h_weights.data(), dweights, h_weights.size() * sizeof(float),
+                              hipMemcpyDeviceToHost), "router copy weights wave64") &&
+             hip_ok(hipMemcpy(h_probs.data(), dprobs, h_probs.size() * sizeof(float),
+                              hipMemcpyDeviceToHost), "router copy probs wave64");
+    }
+    size_t mismatches = 0;
+    if (ok) {
+        for (size_t i = 0; i < h_sel.size(); i++) {
+            mismatches += h_sel[i] != href_sel[i];
+            mismatches += std::memcmp(&h_weights[i], &href_weights[i], sizeof(float)) != 0;
+        }
+        for (size_t i = 0; i < h_probs.size(); i++)
+            mismatches += std::memcmp(&h_probs[i], &href_probs[i], sizeof(float)) != 0;
+    }
+    std::printf("ROUTER WAVE64 %s (%u experts, %zu bit mismatches)\n",
+                ok && mismatches == 0 ? "PASS" : "FAIL", N_EXPERT, mismatches);
+    (void)hipFree(dprobs); (void)hipFree(dweights); (void)hipFree(dselected);
+    (void)hipFree(dbias); (void)hipFree(dlogits);
+    return ok && mismatches == 0;
+}
+
 int main() {
     const int waves = MTILES;
     std::vector<float> hA(waves * 512), hB(waves * NB * 512);
@@ -253,6 +333,8 @@ int main() {
     if (max_err > 1e-3) { printf("SHIM TEST NUMERIC MISMATCH\n"); return 4; }
     if (!test_q8_wave64_row_packing()) return 5;
     if (!test_f16_pair_workgroup_sizing()) return 6;
+    if (!test_router_wave64<DS4_ROCM_N_EXPERT>()) return 7;
+    if (!test_router_wave64<DS4_ROCM_MAX_N_EXPERT>()) return 8;
     printf("SHIM TEST PASS\n");
     return 0;
 }

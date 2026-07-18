@@ -363,7 +363,7 @@ endif
 tests/rocm_long_context_smoke: tests/cuda_long_context_smoke.o ds4_rocm.o
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-tests/gfx906_wmma_test: tests/shim_test.cu rocm/ds4_rocm_wmma_gfx906.cuh rocm/ds4_rocm_q8.cuh
+tests/gfx906_wmma_test: tests/shim_test.cu rocm/ds4_rocm_wmma_gfx906.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_router.cuh
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -I. -o $@ tests/shim_test.cu
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

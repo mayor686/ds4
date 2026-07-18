@@ -4756,6 +4756,8 @@ struct ds4_rocm_runtime_config {
     int glm_grouped_qk_low;
     int q8_decode_sharedx_64k;
     int graph_dump;
+    int router_wave64;
+    int attention_cooperative_dot;
     uint32_t q8_decode_rpb;
     uint32_t f16_pair_decode_rpb;
     uint32_t q8_hc_decode_rpb;
@@ -4809,6 +4811,15 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
+#if defined(DS4_GFX906)
+        g_rocm_cfg.router_wave64 =
+            !cuda_env_present(getenv("DS4_ROCM_DISABLE_ROUTER_WAVE64"));
+        g_rocm_cfg.attention_cooperative_dot =
+            !cuda_env_present(getenv("DS4_ROCM_DISABLE_ATTENTION_COOP_DOT"));
+#else
+        g_rocm_cfg.router_wave64 = 0;
+        g_rocm_cfg.attention_cooperative_dot = 0;
+#endif
         uint32_t q8_decode_default = g_quality_mode ? 8u : 1u;
 #if defined(DS4_GFX906)
         /* Pack two independent software-wave32 rows into each hardware wave64.
