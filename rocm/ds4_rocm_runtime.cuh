@@ -4742,7 +4742,7 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
     char *end = NULL;
     errno = 0;
     unsigned long v = strtoul(env, &end, 10);
-    if (end == env || errno != 0) return def;
+    if (end == env || *end != '\0' || errno != 0 || v > UINT32_MAX) return def;
     return cuda_rows_per_block_or_default((uint32_t)v, def);
 }
 
@@ -4756,6 +4756,10 @@ struct ds4_rocm_runtime_config {
     int glm_grouped_qk_low;
     int q8_decode_sharedx_64k;
     int graph_dump;
+    uint32_t q8_decode_rpb;
+    uint32_t f16_pair_decode_rpb;
+    uint32_t q8_hc_decode_rpb;
+    uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
     uint32_t moe_decode_gate_rpb;
     uint32_t moe_decode_down_rpb;
@@ -4805,6 +4809,26 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
+        uint32_t q8_decode_default = g_quality_mode ? 8u : 1u;
+#if defined(DS4_GFX906)
+        /* Pack two independent software-wave32 rows into each hardware wave64.
+         * Row arithmetic and reduction order remain unchanged. */
+        if (!g_quality_mode) q8_decode_default = 2u;
+#endif
+        g_rocm_cfg.q8_decode_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_Q8_DECODE_RPB",
+                                               q8_decode_default);
+        uint32_t f16_pair_default = 32u;
+#if defined(DS4_GFX906)
+        /* A 1024-thread block exposes too few workgroups for the 60 CUs in
+         * Vega 20 at the 256/512/1024-row decode shapes. */
+        f16_pair_default = 8u;
+#endif
+        g_rocm_cfg.f16_pair_decode_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_F16_PAIR_DECODE_RPB",
+                                               f16_pair_default);
+        g_rocm_cfg.q8_hc_decode_rpb = g_quality_mode ? 8u : 16u;
+        g_rocm_cfg.attn_out_low_decode_rpb = g_quality_mode ? 8u : 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
             moe_decode_rpb_env != NULL && moe_decode_rpb_env[0] != '\0';

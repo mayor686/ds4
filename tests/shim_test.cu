@@ -2,14 +2,18 @@
 // Mimics the ds4 MoE tile kernel pattern: blockDim=256, wave=tid>>5 (8 software
 // wave32 groups on wave64 hardware), rocwmma fragment load/mma/store.
 // Verifies: launch safety (no HSA exception) + numerics vs CPU reference.
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+#include "ds4_rocm.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
-#include "rocm/ds4_rocm_wmma_gfx906.cuh"
+#define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
+#define MASK_T uint64_t
+#define DS4_ROCM_UNUSED __attribute__((unused))
+#include "rocm/ds4_rocm_common.cuh"
+#include "rocm/ds4_rocm_q8.cuh"
 
 #define MTILES 8
 #define NB 4  // 4 B fragments per wave like the MoE gate_up_mid kernel (bg0,bu0,bg1,bu1)
@@ -67,6 +71,132 @@ static void ref_gemm(const std::vector<float> &A, const std::vector<float> &B,
         }
 }
 
+static bool test_q8_wave64_row_packing() {
+    const uint64_t in_dim = 4096;
+    const uint64_t out_dim = 4097;
+    const uint64_t blocks = in_dim / 32;
+    const size_t weight_bytes = (size_t)out_dim * blocks * 34u;
+
+    std::vector<unsigned char> hw(weight_bytes);
+    std::vector<int8_t> hxq(blocks * 32u);
+    std::vector<float> hxscale(blocks);
+    std::vector<float> h1(out_dim), h2(out_dim);
+    for (uint64_t row = 0; row < out_dim; row++) {
+        for (uint64_t block = 0; block < blocks; block++) {
+            const half scale = __float2half(0.0025f * (float)(1u + ((row + block) % 13u)));
+            unsigned char *dst = hw.data() + ((size_t)row * blocks + block) * 34u;
+            std::memcpy(dst, &scale, sizeof(scale));
+            for (uint32_t i = 0; i < 32u; i++)
+                dst[2u + i] = (unsigned char)(int8_t)(((row * 3u + block * 5u + i * 7u) % 255u) - 127);
+        }
+    }
+    for (size_t i = 0; i < hxq.size(); i++) hxq[i] = (int8_t)(((i * 11u) % 255u) - 127);
+    for (size_t i = 0; i < hxscale.size(); i++) hxscale[i] = 0.001f * (float)(1u + (i % 17u));
+
+    unsigned char *dw = nullptr;
+    int8_t *dxq = nullptr;
+    float *dxscale = nullptr, *d1 = nullptr, *d2 = nullptr;
+    const bool allocated =
+        hip_ok(hipMalloc(&dw, hw.size()), "q8 malloc weights") &&
+        hip_ok(hipMalloc(&dxq, hxq.size()), "q8 malloc activation") &&
+        hip_ok(hipMalloc(&dxscale, hxscale.size() * sizeof(float)), "q8 malloc scales") &&
+        hip_ok(hipMalloc(&d1, h1.size() * sizeof(float)), "q8 malloc rpb1") &&
+        hip_ok(hipMalloc(&d2, h2.size() * sizeof(float)), "q8 malloc rpb2");
+    if (!allocated) {
+        (void)hipFree(d2); (void)hipFree(d1); (void)hipFree(dxscale);
+        (void)hipFree(dxq); (void)hipFree(dw);
+        return false;
+    }
+    bool ok =
+        hip_ok(hipMemcpy(dw, hw.data(), hw.size(), hipMemcpyHostToDevice), "q8 copy weights") &&
+        hip_ok(hipMemcpy(dxq, hxq.data(), hxq.size(), hipMemcpyHostToDevice), "q8 copy activation") &&
+        hip_ok(hipMemcpy(dxscale, hxscale.data(), hxscale.size() * sizeof(float), hipMemcpyHostToDevice),
+               "q8 copy scales");
+    if (ok) {
+        matmul_q8_0_preq_rows_w32_kernel<<<(unsigned)out_dim, 32>>>(
+            d1, dw, dxq, dxscale, in_dim, out_dim, blocks, 1u, 1);
+        matmul_q8_0_preq_rows_w32_kernel<<<((unsigned)out_dim + 1u) / 2u, 64>>>(
+            d2, dw, dxq, dxscale, in_dim, out_dim, blocks, 2u, 1);
+        ok = hip_ok(hipDeviceSynchronize(), "q8 packed rows launch") &&
+             hip_ok(hipMemcpy(h1.data(), d1, h1.size() * sizeof(float), hipMemcpyDeviceToHost),
+                    "q8 copy rpb1") &&
+             hip_ok(hipMemcpy(h2.data(), d2, h2.size() * sizeof(float), hipMemcpyDeviceToHost),
+                    "q8 copy rpb2");
+    }
+    size_t mismatches = 0;
+    if (ok) {
+        for (size_t i = 0; i < h1.size(); i++)
+            if (std::memcmp(&h1[i], &h2[i], sizeof(float)) != 0) mismatches++;
+    }
+    std::printf("Q8 WAVE64 ROW PACKING %s (%zu rows, %zu bit mismatches)\n",
+                ok && mismatches == 0 ? "PASS" : "FAIL", h1.size(), mismatches);
+    (void)hipFree(d2); (void)hipFree(d1); (void)hipFree(dxscale);
+    (void)hipFree(dxq); (void)hipFree(dw);
+    return ok && mismatches == 0;
+}
+
+static bool test_f16_pair_workgroup_sizing() {
+    const uint32_t in_dim = 1024;
+    const uint32_t out_dim = 513;
+    std::vector<half> hw0((size_t)in_dim * out_dim), hw1(hw0.size());
+    std::vector<float> hx(in_dim), href0(out_dim), href1(out_dim), h0(out_dim), h1(out_dim);
+    for (size_t i = 0; i < hw0.size(); i++) {
+        hw0[i] = __float2half((float)((int)(i % 31u) - 15) / 32.0f);
+        hw1[i] = __float2half((float)((int)(i % 29u) - 14) / 32.0f);
+    }
+    for (uint32_t i = 0; i < in_dim; i++) hx[i] = (float)((int)(i % 23u) - 11) / 16.0f;
+
+    half *dw0 = nullptr, *dw1 = nullptr;
+    float *dx = nullptr, *do0 = nullptr, *do1 = nullptr;
+    const bool allocated =
+        hip_ok(hipMalloc(&dw0, hw0.size() * sizeof(half)), "f16 pair malloc w0") &&
+        hip_ok(hipMalloc(&dw1, hw1.size() * sizeof(half)), "f16 pair malloc w1") &&
+        hip_ok(hipMalloc(&dx, hx.size() * sizeof(float)), "f16 pair malloc x") &&
+        hip_ok(hipMalloc(&do0, href0.size() * sizeof(float)), "f16 pair malloc out0") &&
+        hip_ok(hipMalloc(&do1, href1.size() * sizeof(float)), "f16 pair malloc out1");
+    if (!allocated) {
+        (void)hipFree(do1); (void)hipFree(do0); (void)hipFree(dx);
+        (void)hipFree(dw1); (void)hipFree(dw0);
+        return false;
+    }
+    bool ok =
+        hip_ok(hipMemcpy(dw0, hw0.data(), hw0.size() * sizeof(half), hipMemcpyHostToDevice),
+               "f16 pair copy w0") &&
+        hip_ok(hipMemcpy(dw1, hw1.data(), hw1.size() * sizeof(half), hipMemcpyHostToDevice),
+               "f16 pair copy w1") &&
+        hip_ok(hipMemcpy(dx, hx.data(), hx.size() * sizeof(float), hipMemcpyHostToDevice),
+               "f16 pair copy x");
+    if (ok) {
+        matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<(out_dim + 31u) / 32u,
+            1024u, (size_t)in_dim * sizeof(float)>>>(do0, do1, dw0, dw1, dx, in_dim, out_dim);
+        ok = hip_ok(hipDeviceSynchronize(), "f16 pair rpb32 launch") &&
+             hip_ok(hipMemcpy(href0.data(), do0, href0.size() * sizeof(float), hipMemcpyDeviceToHost),
+                    "f16 pair copy reference 0") &&
+             hip_ok(hipMemcpy(href1.data(), do1, href1.size() * sizeof(float), hipMemcpyDeviceToHost),
+                    "f16 pair copy reference 1");
+    }
+    if (ok) {
+        matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<(out_dim + 7u) / 8u,
+            256u, (size_t)in_dim * sizeof(float)>>>(do0, do1, dw0, dw1, dx, in_dim, out_dim);
+        ok = hip_ok(hipDeviceSynchronize(), "f16 pair rpb8 launch") &&
+             hip_ok(hipMemcpy(h0.data(), do0, h0.size() * sizeof(float), hipMemcpyDeviceToHost),
+                    "f16 pair copy rpb8 0") &&
+             hip_ok(hipMemcpy(h1.data(), do1, h1.size() * sizeof(float), hipMemcpyDeviceToHost),
+                    "f16 pair copy rpb8 1");
+    }
+    size_t mismatches = 0;
+    if (ok) {
+        for (size_t i = 0; i < h0.size(); i++)
+            if (std::memcmp(&h0[i], &href0[i], sizeof(float)) != 0 ||
+                std::memcmp(&h1[i], &href1[i], sizeof(float)) != 0) mismatches++;
+    }
+    std::printf("F16 PAIR WORKGROUP SIZING %s (%zu rows, %zu bit mismatches)\n",
+                ok && mismatches == 0 ? "PASS" : "FAIL", h0.size(), mismatches);
+    (void)hipFree(do1); (void)hipFree(do0); (void)hipFree(dx);
+    (void)hipFree(dw1); (void)hipFree(dw0);
+    return ok && mismatches == 0;
+}
+
 int main() {
     const int waves = MTILES;
     std::vector<float> hA(waves * 512), hB(waves * NB * 512);
@@ -121,6 +251,8 @@ int main() {
     (void)hipFree(dB);
     (void)hipFree(dA);
     if (max_err > 1e-3) { printf("SHIM TEST NUMERIC MISMATCH\n"); return 4; }
+    if (!test_q8_wave64_row_packing()) return 5;
+    if (!test_f16_pair_workgroup_sizing()) return 6;
     printf("SHIM TEST PASS\n");
     return 0;
 }

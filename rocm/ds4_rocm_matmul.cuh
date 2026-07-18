@@ -822,7 +822,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!w0 || !w1) return 0;
     if (!g_quality_mode && !cuda_runtime_config()->graph_dump) {
         if (in_dim <= 8192u && in_dim * sizeof(float) <= 65536u) {
-            const uint32_t rows_per_block = 32u;
+            const uint32_t rows_per_block = cuda_runtime_config()->f16_pair_decode_rpb;
             matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
                     ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                     rows_per_block * 32u,
