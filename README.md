@@ -302,12 +302,19 @@ the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 
 The six-gfx906 PP6 example includes two self-contained profiles. Edit
 `MODEL_PATH` inside the selected file and run it directly; no launch-time
-environment variables are required:
+environment variables are required. The speed profile uses a balanced 8 + 7x5
+layer split at 32K context, while the capacity profile keeps the conservative
+13 + 6x5 split needed by its larger KV cache:
 
 ```sh
-./run-speed.sh    # resident weights, 300K context, maximum throughput
+./run-speed.sh    # resident weights, 32K context, maximum throughput
 ./run-context.sh  # 2GB expert cache per GPU, native 1M context
 ```
+
+`run.sh` itself is not tied to that machine: `COORD_DEVICE`, `COORD_LAYERS`,
+and the space-separated `WORKER_SPECS` (`DEVICE,START:END`) describe an
+arbitrary distributed gfx906 route. The two profile files are concrete
+six-GPU examples whose settings can be edited in place.
 
 ### Practical SSD streaming examples
 

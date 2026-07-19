@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# run.sh — shared DeepSeek-V4-Flash IQ2XXS launcher for 6x AMD gfx906.
-# Use run-speed.sh for resident throughput or run-context.sh for 1M context.
+# run.sh — configurable distributed DeepSeek-V4-Flash launcher for AMD gfx906.
+# The supplied run-speed.sh and run-context.sh are validated six-GPU examples.
 #
 # Adapted from the 4x RTX 3090 recipe:
 #   https://github.com/Forge-the-Kingdom/inference-serving-recipes/blob/main/recipes/dwarfstar/deepseek-v4-iq2-4x3090-gpu-resident.md
@@ -9,21 +9,19 @@
 # Key changes vs the CUDA recipe:
 #   - Backend flag is --rocm (not --cuda) in a DS4_ROCM_BUILD.
 #   - Per-process GPU pinning uses ROCR_VISIBLE_DEVICES (not CUDA_VISIBLE_DEVICES).
-#   - The coordinator runs on ROCR device 2, the 32 GB card (rocm-smi card3).
-#   - ROCR device 0 is the 16 GB GUI card (rocm-smi card4) and cannot be freed;
-#     it remains in the route because the desktop cannot release it.
+#   - Coordinator and worker device indexes are explicit below because ROCR
+#     indexes need not match the rocm-smi card numbers.
 #
 # Prerequisites:
 #   - ds4 and ds4-server built for your ROCm arch:  make rocm ROCM_ARCH=<arch>
 #     gfx906 builds use the in-tree wave64-safe rocWMMA compatibility shim.
-#   - Enough free VRAM on all 6 GPUs. ROCR 0 may remain attached to the GUI;
-#     this map deliberately gives it only six layers.
+#   - Enough free VRAM on every device selected by the chosen profile.
 #   - The Flash IQ2XXS GGUF downloaded, e.g.:
 #       ./download_model.sh q2-imatrix
 #     which links ./ds4flash.gguf to the file below.
 #
 # Usage:
-#   1. Set MODEL_PATH below to your GGUF.
+#   1. Set MODEL_PATH and the device/layer map below for your system.
 #   2. ./run.sh            # starts workers then the coordinator
 #   3. In another shell:   curl -s http://127.0.0.1:8080/v1/models
 #   Ctrl+C the coordinator; workers exit when the route drops.
@@ -104,19 +102,18 @@ MTP_PATH="${MTP_PATH:-${SCRIPT_DIR}/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}"
 MTP_DRAFT="${MTP_DRAFT:-2}"
 MTP_ARGS=()
 
-# --- layer split: 43 layers (0..42) across 6 GPUs, coordinator owns output head ---
-# REBALANCED: coordinator (MI50 32GB) takes 13 layers; 5 workers take 6 each.
-# Per-layer ~1.84 GiB: coordinator ~25.4 GiB (fits 32GB), workers ~11 GiB
-# (leaves ~3.5 GiB free on 16GB, vs ~1.8 GiB with 7 layers which caused OOMs).
+# --- layer split: all 43 layers (0..42), coordinator owns output head ---
+# The context profile keeps the conservative 13 + 6x5 split.  The speed
+# profile uses 8 + 7x5 at a smaller context: equal-size GPU stages remove the
+# coordinator prefill bottleneck while still fitting the 16GB workers.
 #
-# DEVICE MAP (verified via lspci + worker name reports):
-#   ROCR device index = rocminfo node (N+1), NOT the rocm-smi "GPU[N]" column!
-#   ROCR 0 = Radeon VII 16GB   ROCR 1 = Pro VII 16GB
-#   ROCR 2 = MI50 32GB  <-- coordinator goes HERE
-#   ROCR 3 = Pro VII 16GB      ROCR 4 = Pro VII 16GB
-#   ROCR 5 = Radeon VII 16GB
-#   device 2 (MI50 32GB): coordinator, layers 0:12 (+ embedding + output head)
-#   resident: device 0=13:18, 1=19:24, 3=25:30, 4=31:36, 5=37:42
+# A worker spec is DEVICE,LAYER_START:LAYER_END.  Keeping the route in data
+# instead of hard-coding five workers makes this shared launcher usable for
+# other gfx906 counts and memory layouts.  The two example profiles below set
+# the exact six-GPU maps validated on the development machine.
+COORD_DEVICE="${COORD_DEVICE:-2}"
+COORD_LAYERS="${COORD_LAYERS:-0:12}"
+WORKER_SPECS="${WORKER_SPECS:-0,13:18 1,19:24 3,25:30 4,31:36 5,37:42}"
 
 WORKER_PIDS=()
 
@@ -186,22 +183,27 @@ if [ "${SSD_STREAMING}" != "0" ]; then
 else
     echo "run.sh: starting GPU-resident profile, ctx=${CTX}, chunk=${PREFILL_CHUNK}, window=${DIST_WINDOW}"
 fi
-start_worker 0 13:18 "${SSD_ARGS[@]}"; check_last_worker
-start_worker 1 19:24 "${SSD_ARGS[@]}"; check_last_worker
-start_worker 3 25:30 "${SSD_ARGS[@]}"; check_last_worker
-start_worker 4 31:36 "${SSD_ARGS[@]}"; check_last_worker
-start_worker 5 37:42 "${SSD_ARGS[@]}"; check_last_worker
+for worker_spec in ${WORKER_SPECS}; do
+    IFS=, read -r worker_dev worker_layers worker_extra <<< "${worker_spec}"
+    if [[ ! "${worker_dev}" =~ ^[0-9]+$ ]] ||
+       [[ ! "${worker_layers}" =~ ^[0-9]+:[0-9]+$ ]] ||
+       [ -n "${worker_extra}" ]; then
+        echo "run.sh: invalid worker spec '${worker_spec}'; expected DEVICE,START:END" >&2
+        exit 1
+    fi
+    start_worker "${worker_dev}" "${worker_layers}" "${SSD_ARGS[@]}"
+    check_last_worker
+done
 
-# Let workers fail visibly before the coordinator commits the big allocation on
-# ROCR device 2 (the physical rocm-smi card3).
+# Let workers fail visibly before the coordinator commits its allocation.
 sleep 2
 
-echo "run.sh: starting coordinator on ROCR device 2 (32GB), layers 0:12 plus local output head"
+echo "run.sh: starting coordinator on ROCR device ${COORD_DEVICE}, layers ${COORD_LAYERS} plus local output head"
 COORD_ENV=(env
     -u DS4_DIST_DECODE_PROFILE
     DS4_ROCM_WEIGHT_ARENA_CHUNK_MB=256
-    DS4_LOCK_FILE=/tmp/ds4-coordinator.lock
-    ROCR_VISIBLE_DEVICES=2)
+    DS4_LOCK_FILE="/tmp/ds4-coordinator-${COORD_DEVICE}.lock"
+    ROCR_VISIBLE_DEVICES="${COORD_DEVICE}")
 if [ "${DS4_COORD_SERIALIZE}" != "0" ]; then
     COORD_ENV+=(AMD_SERIALIZE_KERNEL="${DS4_COORD_SERIALIZE}")
 fi
@@ -219,7 +221,7 @@ fi
     --ctx "${CTX}" \
     --tokens "${MAX_TOKENS}" \
     --host "${HTTP_HOST}" --port "${HTTP_PORT}" \
-    --role coordinator --layers 0:12 \
+    --role coordinator --layers "${COORD_LAYERS}" \
     "${MTP_ARGS[@]}" \
     "${SSD_ARGS[@]}" \
     --listen "${DIST_HOST}" "${DIST_PORT}" \

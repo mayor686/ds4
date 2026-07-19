@@ -6,8 +6,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export MODEL_PATH="${SCRIPT_DIR}/ds4flash.gguf"
-export CTX=300000
-export MAX_TOKENS=300000
+# Seven resident layers fit the 16GB workers at 32K context.  This balanced
+# split is about 50% faster in prefill than the capacity-oriented 13 + 6x5.
+export CTX=32768
+export MAX_TOKENS=32768
 export PREFILL_CHUNK=64
 export DIST_WINDOW=5
 export WORKER_START_DELAY=5
@@ -21,5 +23,8 @@ export SSD_STREAMING=0
 export SSD_STREAMING_CACHE_EXPERTS=
 export SSD_STREAMING_PRELOAD_EXPERTS=
 export SSD_STREAMING_COLD=0
+export COORD_DEVICE=2
+export COORD_LAYERS=0:7
+export WORKER_SPECS="0,8:14 1,15:21 3,22:28 4,29:35 5,36:42"
 
 exec "${SCRIPT_DIR}/run.sh"
