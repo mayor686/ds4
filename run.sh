@@ -68,6 +68,11 @@ DS4_COORD_SERIALIZE="${DS4_COORD_SERIALIZE:-0}"
 ROCPROF_COORD_OUTPUT_DIR="${ROCPROF_COORD_OUTPUT_DIR:-}"
 ROCPROF_WORKER_DEVICE="${ROCPROF_WORKER_DEVICE:-}"
 ROCPROF_WORKER_OUTPUT_DIR="${ROCPROF_WORKER_OUTPUT_DIR:-}"
+TRACE_FILE="${TRACE_FILE:-}"
+TRACE_ARGS=()
+if [ -n "${TRACE_FILE}" ]; then
+    TRACE_ARGS+=(--trace "${TRACE_FILE}")
+fi
 
 # --- optional SSD-backed routed-expert cache ---
 # Keep disabled for the fastest fully resident path.  Enabling it leaves
@@ -221,6 +226,7 @@ fi
     --ctx "${CTX}" \
     --tokens "${MAX_TOKENS}" \
     --host "${HTTP_HOST}" --port "${HTTP_PORT}" \
+    "${TRACE_ARGS[@]}" \
     --role coordinator --layers "${COORD_LAYERS}" \
     "${MTP_ARGS[@]}" \
     "${SSD_ARGS[@]}" \

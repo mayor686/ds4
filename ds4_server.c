@@ -1216,13 +1216,273 @@ bad:
     return true;
 }
 
+static void json_escape(buf *b, const char *s);
+
+typedef struct {
+    char *key;
+    char *value;
+} json_canonical_member;
+
+static int json_canonical_member_cmp(const void *a, const void *b) {
+    const json_canonical_member *ma = a;
+    const json_canonical_member *mb = b;
+    int cmp = strcmp(ma->key, mb->key);
+    return cmp ? cmp : strcmp(ma->value, mb->value);
+}
+
+static void json_canonical_members_free(json_canonical_member *members, int len) {
+    for (int i = 0; i < len; i++) {
+        free(members[i].key);
+        free(members[i].value);
+    }
+    free(members);
+}
+
+static bool json_canonical_value(const char **p, buf *out, int depth,
+                                 bool preserve_object_order);
+
+static bool json_canonical_object(const char **p, buf *out, int depth,
+                                  bool preserve_order) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+
+    json_canonical_member *members = NULL;
+    int len = 0, cap = 0;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+
+        buf value = {0};
+        const bool property_map = !strcmp(key, "properties");
+        if (!json_canonical_value(p, &value, depth + 1, property_map)) {
+            free(key);
+            buf_free(&value);
+            goto bad;
+        }
+        for (int i = 0; i < len; i++) {
+            if (!strcmp(members[i].key, key)) {
+                free(key);
+                buf_free(&value);
+                goto bad;
+            }
+        }
+        if (len == cap) {
+            cap = cap ? cap * 2 : 8;
+            members = xrealloc(members, (size_t)cap * sizeof(members[0]));
+        }
+        members[len++] = (json_canonical_member){
+            .key = key,
+            .value = buf_take(&value),
+        };
+
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            json_ws(p);
+            continue;
+        }
+        if (**p != '}') goto bad;
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (!preserve_order && len > 1)
+        qsort(members, (size_t)len, sizeof(members[0]),
+              json_canonical_member_cmp);
+    buf_putc(out, '{');
+    for (int i = 0; i < len; i++) {
+        if (i) buf_putc(out, ',');
+        json_escape(out, members[i].key);
+        buf_putc(out, ':');
+        buf_puts(out, members[i].value);
+    }
+    buf_putc(out, '}');
+    json_canonical_members_free(members, len);
+    return true;
+
+bad:
+    json_canonical_members_free(members, len);
+    return false;
+}
+
+static bool json_canonical_array(const char **p, buf *out, int depth) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    buf_putc(out, '[');
+    bool wrote = false;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (wrote) buf_putc(out, ',');
+        if (!json_canonical_value(p, out, depth + 1, false)) return false;
+        wrote = true;
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            json_ws(p);
+            continue;
+        }
+        if (**p != ']') return false;
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    buf_putc(out, ']');
+    return true;
+}
+
+static bool json_canonical_value(const char **p, buf *out, int depth,
+                                 bool preserve_object_order) {
+    json_ws(p);
+    if (**p == '{')
+        return json_canonical_object(p, out, depth, preserve_object_order);
+    if (**p == '[') return json_canonical_array(p, out, depth);
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        json_escape(out, s);
+        free(s);
+        return true;
+    }
+    if (json_lit(p, "true")) {
+        buf_puts(out, "true");
+        return true;
+    }
+    if (json_lit(p, "false")) {
+        buf_puts(out, "false");
+        return true;
+    }
+    if (json_lit(p, "null")) {
+        buf_puts(out, "null");
+        return true;
+    }
+
+    const char *start = *p;
+    double number = 0.0;
+    if (!json_number(p, &number)) return false;
+    buf_append(out, start, (size_t)(*p - start));
+    return true;
+}
+
+static char *json_canonicalize(const char *json) {
+    const char *p = json ? json : "null";
+    buf out = {0};
+    if (!json_canonical_value(&p, &out, 0, false)) {
+        buf_free(&out);
+        return NULL;
+    }
+    json_ws(&p);
+    if (*p) {
+        buf_free(&out);
+        return NULL;
+    }
+    return buf_take(&out);
+}
+
 static void append_raw_json_line(buf *b, const char *json) {
     if (!json || !json[0]) return;
     if (b->len) buf_putc(b, '\n');
     buf_puts(b, json);
 }
 
-static void json_escape(buf *b, const char *s);
+typedef struct {
+    char *name;
+    char *json;
+} tool_schema_line;
+
+static char *tool_schema_json_name(const char *json) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "name")) {
+            char *name = NULL;
+            free(key);
+            return json_string(&p, &name) ? name : NULL;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
+static int tool_schema_line_cmp(const void *a, const void *b) {
+    const tool_schema_line *sa = a;
+    const tool_schema_line *sb = b;
+    int cmp = strcmp(sa->name ? sa->name : "", sb->name ? sb->name : "");
+    return cmp ? cmp : strcmp(sa->json, sb->json);
+}
+
+static char *tool_schema_lines_sorted(const char *schemas) {
+    if (!schemas || !schemas[0]) return xstrdup("");
+    char *copy = xstrdup(schemas);
+    tool_schema_line *lines = NULL;
+    int len = 0, cap = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(copy, "\n", &save);
+         line;
+         line = strtok_r(NULL, "\n", &save))
+    {
+        if (len == cap) {
+            cap = cap ? cap * 2 : 8;
+            lines = xrealloc(lines, (size_t)cap * sizeof(lines[0]));
+        }
+        lines[len++] = (tool_schema_line){
+            .name = tool_schema_json_name(line),
+            .json = xstrdup(line),
+        };
+    }
+    /* Duplicate or missing names are malformed/ambiguous tool sets.  Keep
+     * their input order so canonicalization cannot silently change which
+     * duplicate schema supplies the argument order used for DSML replay. */
+    bool sortable = true;
+    for (int i = 0; i < len && sortable; i++) {
+        if (!lines[i].name || !lines[i].name[0]) {
+            sortable = false;
+            break;
+        }
+        for (int j = 0; j < i; j++) {
+            if (!strcmp(lines[i].name, lines[j].name)) {
+                sortable = false;
+                break;
+            }
+        }
+    }
+    if (sortable && len > 1)
+        qsort(lines, (size_t)len, sizeof(lines[0]), tool_schema_line_cmp);
+
+    buf out = {0};
+    for (int i = 0; i < len; i++) {
+        append_raw_json_line(&out, lines[i].json);
+        free(lines[i].name);
+        free(lines[i].json);
+    }
+    free(lines);
+    free(copy);
+    return buf_take(&out);
+}
 
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
@@ -1579,8 +1839,11 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         char *schema =
             responses_namespace_function_schema_from_tool(tool_raw, name, &wire_name);
         if (schema) {
-            append_raw_json_line(schemas, schema);
-            tool_schema_orders_add_json_wire(orders, schema, name, wire_name, false);
+            char *canonical = json_canonicalize(schema);
+            const char *stable = canonical ? canonical : schema;
+            append_raw_json_line(schemas, stable);
+            tool_schema_orders_add_json_wire(orders, stable, name, wire_name, false);
+            free(canonical);
             appended = true;
         }
         free(schema);
@@ -1620,17 +1883,26 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
         if (!json_raw_value(p, &raw)) goto bad;
         char *function = openai_function_schema_from_tool(raw);
         if (function) {
-            append_raw_json_line(&schemas, function);
-            tool_schema_orders_add_json(orders, function);
+            char *canonical = json_canonicalize(function);
+            const char *stable = canonical ? canonical : function;
+            append_raw_json_line(&schemas, stable);
+            tool_schema_orders_add_json(orders, stable);
+            free(canonical);
         } else if (!append_responses_namespace_tool_schemas(&schemas, orders, raw)) {
             char *special = responses_special_schema_from_tool(raw);
             if (special) {
-                append_raw_json_line(&schemas, special);
-                tool_schema_orders_add_json_wire(orders, special,
+                char *canonical = json_canonicalize(special);
+                const char *stable = canonical ? canonical : special;
+                append_raw_json_line(&schemas, stable);
+                tool_schema_orders_add_json_wire(orders, stable,
                                                  NULL, NULL, true);
+                free(canonical);
             } else {
-                append_raw_json_line(&schemas, raw);
-                tool_schema_orders_add_json(orders, raw);
+                char *canonical = json_canonicalize(raw);
+                const char *stable = canonical ? canonical : raw;
+                append_raw_json_line(&schemas, stable);
+                tool_schema_orders_add_json(orders, stable);
+                free(canonical);
             }
             free(special);
         }
@@ -1642,7 +1914,9 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
     }
     if (**p != ']') goto bad;
     (*p)++;
-    *out = buf_take(&schemas);
+    char *joined = buf_take(&schemas);
+    *out = tool_schema_lines_sorted(joined);
+    free(joined);
     return true;
 bad:
     buf_free(&schemas);
@@ -13244,6 +13518,142 @@ static void test_tool_schema_order_from_openai_tools(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_tool_schema_list_order_is_canonical(void) {
+    const char *ab =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"description\":\"read\",\"parameters\":{\"type\":\"object\"}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"stat\","
+        "\"description\":\"stat\",\"parameters\":{\"type\":\"object\"}}}]";
+    const char *ba =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"stat\","
+        "\"description\":\"stat\",\"parameters\":{\"type\":\"object\"}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"description\":\"read\",\"parameters\":{\"type\":\"object\"}}}]";
+    const char *pa = ab;
+    const char *pb = ba;
+    char *sa = NULL, *sb = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    TEST_ASSERT(parse_tools_value(&pa, &sa, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &sb, &ob));
+    TEST_ASSERT(sa && sb && !strcmp(sa, sb));
+    const char *read = sa ? strstr(sa, "\"name\":\"read\"") : NULL;
+    const char *stat = sa ? strstr(sa, "\"name\":\"stat\"") : NULL;
+    TEST_ASSERT(read && stat && read < stat);
+    free(sa);
+    free(sb);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
+static void test_tool_schema_json_key_order_is_canonical(void) {
+    const char *normal =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"description\":\"read one file\",\"parameters\":{"
+        "\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}}]";
+    const char *rekeyed =
+        "[{\"function\":{\"parameters\":{\"properties\":{"
+        "\"path\":{\"type\":\"string\"}},\"type\":\"object\"},"
+        "\"description\":\"read one file\",\"name\":\"read\"},"
+        "\"type\":\"function\"}]";
+    const char *pa = normal;
+    const char *pb = rekeyed;
+    char *sa = NULL, *sb = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    TEST_ASSERT(parse_tools_value(&pa, &sa, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &sb, &ob));
+    TEST_ASSERT(sa && sb && !strcmp(sa, sb));
+    const tool_schema_order *order = tool_schema_orders_find(&ob, "read");
+    TEST_ASSERT(order && order->len == 1 && !strcmp(order->prop[0], "path"));
+    free(sa);
+    free(sb);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
+static void test_tool_schema_semantic_changes_remain_distinct(void) {
+    const char *one =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"description\":\"read one file\",\"parameters\":{\"type\":\"object\"}}}]";
+    const char *two =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"description\":\"read two files\",\"parameters\":{\"type\":\"object\"}}}]";
+    const char *pa = one;
+    const char *pb = two;
+    char *sa = NULL, *sb = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    TEST_ASSERT(parse_tools_value(&pa, &sa, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &sb, &ob));
+    TEST_ASSERT(sa && sb && strcmp(sa, sb));
+    free(sa);
+    free(sb);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
+static void test_tool_schema_property_order_is_preserved(void) {
+    const char *path_first =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"},\"encoding\":{\"type\":\"string\"}}}}}]";
+    const char *encoding_first =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"encoding\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}}}}}]";
+    const char *pa = path_first;
+    const char *pb = encoding_first;
+    char *sa = NULL, *sb = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    TEST_ASSERT(parse_tools_value(&pa, &sa, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &sb, &ob));
+    TEST_ASSERT(sa && sb && strcmp(sa, sb));
+    const tool_schema_order *a = tool_schema_orders_find(&oa, "read");
+    const tool_schema_order *b = tool_schema_orders_find(&ob, "read");
+    TEST_ASSERT(a && a->len == 2 && !strcmp(a->prop[0], "path"));
+    TEST_ASSERT(b && b->len == 2 && !strcmp(b->prop[0], "encoding"));
+    free(sa);
+    free(sb);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
+static void test_duplicate_tool_names_are_not_reordered(void) {
+    const char *ab =
+        "[{\"name\":\"same\",\"description\":\"a\"},"
+        "{\"name\":\"same\",\"description\":\"b\"}]";
+    const char *ba =
+        "[{\"name\":\"same\",\"description\":\"b\"},"
+        "{\"name\":\"same\",\"description\":\"a\"}]";
+    const char *pa = ab;
+    const char *pb = ba;
+    char *sa = NULL, *sb = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    TEST_ASSERT(parse_tools_value(&pa, &sa, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &sb, &ob));
+    TEST_ASSERT(sa && sb && strcmp(sa, sb));
+    free(sa);
+    free(sb);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
+static void test_duplicate_json_keys_are_not_canonicalized(void) {
+    const char *ab =
+        "[{\"name\":\"same\",\"description\":\"a\",\"description\":\"b\"}]";
+    const char *ba =
+        "[{\"name\":\"same\",\"description\":\"b\",\"description\":\"a\"}]";
+    const char *pa = ab;
+    const char *pb = ba;
+    char *sa = NULL, *sb = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    TEST_ASSERT(parse_tools_value(&pa, &sa, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &sb, &ob));
+    TEST_ASSERT(sa && sb && strcmp(sa, sb));
+    free(sa);
+    free(sb);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
 static void test_tool_schema_order_from_responses_tool_search(void) {
     const char *json =
         "[{\"type\":\"tool_search\",\"execution\":\"client\","
@@ -17428,6 +17838,12 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_tool_schema_list_order_is_canonical();
+    test_tool_schema_json_key_order_is_canonical();
+    test_tool_schema_semantic_changes_remain_distinct();
+    test_tool_schema_property_order_is_preserved();
+    test_duplicate_tool_names_are_not_reordered();
+    test_duplicate_json_keys_are_not_canonicalized();
     test_tool_schema_order_from_responses_tool_search();
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
