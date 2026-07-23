@@ -1513,7 +1513,7 @@ static int cuda_stream_resident_evict_one(
     return cuda_stream_resident_evict_at(victim);
 }
 
-static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
+static uint64_t cuda_stream_resident_free_reserve_bytes(uint64_t total_bytes) {
     /*
      * Headroom kept free on the (unified-memory) device while growing the
      * expert cache.  It must cover decode scratch and transient graph buffers
@@ -1522,17 +1522,46 @@ static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
      */
     static int64_t cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_ROCM_STREAM_FREE_RESERVE_GB");
-        uint64_t gib = 16;
-        if (env && env[0]) {
+        const char *env_gb = getenv("DS4_ROCM_STREAM_FREE_RESERVE_GB");
+        const char *env_mb = getenv("DS4_ROCM_STREAM_FREE_RESERVE_MB");
+        uint64_t reserve = 0;
+        if (env_gb && env_gb[0]) {
             char *end = NULL;
             errno = 0;
-            unsigned long v = strtoul(env, &end, 10);
-            if (end != env && *end == '\0' && errno == 0 && v >= 2 && v <= 64) {
-                gib = (uint64_t)v;
+            unsigned long v = strtoul(env_gb, &end, 10);
+            if (end != env_gb && *end == '\0' && errno == 0 && v >= 2 && v <= 64) {
+                reserve = (uint64_t)v * 1073741824ull;
             }
         }
-        cached = (int64_t)(gib * 1024ull * 1024ull * 1024ull);
+        if (reserve == 0 && (!env_gb || !env_gb[0]) && env_mb && env_mb[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(env_mb, &end, 10);
+            if (end != env_mb && *end == '\0' && errno == 0 &&
+                v >= 256u && v <= 16384u) {
+                reserve = (uint64_t)v * 1048576ull;
+            }
+        }
+#if defined(DS4_GFX906)
+        if (reserve == 0) {
+            if (total_bytes == 0) {
+                size_t free_b = 0;
+                size_t total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                    (void)free_b;
+                    total_bytes = (uint64_t)total_b;
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+            reserve = total_bytes / 8u;
+            if (reserve < 4ull * 1073741824ull) reserve = 4ull * 1073741824ull;
+            if (reserve > 16ull * 1073741824ull) reserve = 16ull * 1073741824ull;
+        }
+#else
+        if (reserve == 0) reserve = 16ull * 1073741824ull;
+#endif
+        cached = (int64_t)reserve;
     }
     return (uint64_t)cached;
 }
@@ -1583,8 +1612,8 @@ static int cuda_stream_expert_slab_grow(uint64_t slot_bytes) {
         size_t free_b = 0;
         size_t total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-            (void)total_b;
-            const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
+            const uint64_t reserve =
+                cuda_stream_resident_free_reserve_bytes((uint64_t)total_b);
             if ((uint64_t)free_b < reserve ||
                 slab_bytes > (uint64_t)free_b - reserve) {
                 slab_slots >>= 1u;
@@ -1686,7 +1715,7 @@ static int cuda_stream_resident_alloc(
                     (double)bytes / 1048576.0,
                     layer,
                     expert,
-                    (double)cuda_stream_resident_free_reserve_bytes() / 1073741824.0);
+                    (double)cuda_stream_resident_free_reserve_bytes(0) / 1073741824.0);
             return -1;
         }
 
@@ -5516,8 +5545,8 @@ static int cuda_stream_model_cache_prepare_memory(
         (void)cudaGetLastError();
         return 1;
     }
-    (void)total_b;
-    const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
+    const uint64_t reserve =
+        cuda_stream_resident_free_reserve_bytes((uint64_t)total_b);
     const uint64_t free_bytes = (uint64_t)free_b;
     if (free_bytes >= reserve && request_bytes <= free_bytes - reserve) {
         return 1;

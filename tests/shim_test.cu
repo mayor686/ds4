@@ -240,7 +240,7 @@ static bool test_router_wave64() {
     if (ok) {
         router_select_warp_topk_kernel<N_EXPERT, 32u><<<1, dim3(32, 4, 1)>>>(
             dselected, dweights, dprobs, dbias, nullptr, dlogits, nullptr, 0,
-            0, 1, 1.5f, 1, 0);
+            0, 1, DS4_ROCM_N_EXPERT_USED, 1.5f, 1, 0);
         ok = hip_ok(hipDeviceSynchronize(), "router wave32 launch") &&
              hip_ok(hipMemcpy(href_sel.data(), dselected, href_sel.size() * sizeof(int32_t),
                               hipMemcpyDeviceToHost), "router copy selected reference") &&
@@ -252,7 +252,7 @@ static bool test_router_wave64() {
     if (ok) {
         router_select_warp_topk_kernel<N_EXPERT, 64u><<<1, dim3(64, 1, 1)>>>(
             dselected, dweights, dprobs, dbias, nullptr, dlogits, nullptr, 0,
-            0, 1, 1.5f, 1, 0);
+            0, 1, DS4_ROCM_N_EXPERT_USED, 1.5f, 1, 0);
         ok = hip_ok(hipDeviceSynchronize(), "router wave64 launch") &&
              hip_ok(hipMemcpy(h_sel.data(), dselected, h_sel.size() * sizeof(int32_t),
                               hipMemcpyDeviceToHost), "router copy selected wave64") &&
