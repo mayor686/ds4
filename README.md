@@ -312,8 +312,9 @@ layer split at 32K context, while the capacity profile keeps the conservative
 ```
 
 `run.sh` itself is not tied to that machine: `COORD_DEVICE`, `COORD_LAYERS`,
-and the space-separated `WORKER_SPECS` (`DEVICE,START:END`) describe an
-arbitrary distributed gfx906 route. The two profile files are concrete
+and the space-separated `WORKER_SPECS` (`DEVICE,START:END`, with
+`DEVICE,START:output` for the final worker) describe an arbitrary distributed
+gfx906 route. The two profile files are concrete
 six-GPU examples whose settings can be edited in place.
 
 ### Practical SSD streaming examples

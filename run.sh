@@ -107,18 +107,19 @@ MTP_PATH="${MTP_PATH:-${SCRIPT_DIR}/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}"
 MTP_DRAFT="${MTP_DRAFT:-2}"
 MTP_ARGS=()
 
-# --- layer split: all 43 layers (0..42), coordinator owns output head ---
+# --- layer split: all 43 layers (0..42), final worker owns output head ---
 # The context profile keeps the conservative 13 + 6x5 split.  The speed
 # profile uses 8 + 7x5 at a smaller context: equal-size GPU stages remove the
 # coordinator prefill bottleneck while still fitting the 16GB workers.
 #
-# A worker spec is DEVICE,LAYER_START:LAYER_END.  Keeping the route in data
+# A worker spec is DEVICE,LAYER_START:LAYER_END; use LAYER_START:output for
+# the final worker so it also owns the output head.  Keeping the route in data
 # instead of hard-coding five workers makes this shared launcher usable for
 # other gfx906 counts and memory layouts.  The two example profiles below set
 # the exact six-GPU maps validated on the development machine.
 COORD_DEVICE="${COORD_DEVICE:-2}"
 COORD_LAYERS="${COORD_LAYERS:-0:12}"
-WORKER_SPECS="${WORKER_SPECS:-0,13:18 1,19:24 3,25:30 4,31:36 5,37:42}"
+WORKER_SPECS="${WORKER_SPECS:-0,13:18 1,19:24 3,25:30 4,31:36 5,37:output}"
 
 WORKER_PIDS=()
 
@@ -191,9 +192,9 @@ fi
 for worker_spec in ${WORKER_SPECS}; do
     IFS=, read -r worker_dev worker_layers worker_extra <<< "${worker_spec}"
     if [[ ! "${worker_dev}" =~ ^[0-9]+$ ]] ||
-       [[ ! "${worker_layers}" =~ ^[0-9]+:[0-9]+$ ]] ||
+       [[ ! "${worker_layers}" =~ ^[0-9]+:([0-9]+|output)$ ]] ||
        [ -n "${worker_extra}" ]; then
-        echo "run.sh: invalid worker spec '${worker_spec}'; expected DEVICE,START:END" >&2
+        echo "run.sh: invalid worker spec '${worker_spec}'; expected DEVICE,START:END or DEVICE,START:output" >&2
         exit 1
     fi
     start_worker "${worker_dev}" "${worker_layers}" "${SSD_ARGS[@]}"
@@ -203,7 +204,7 @@ done
 # Let workers fail visibly before the coordinator commits its allocation.
 sleep 2
 
-echo "run.sh: starting coordinator on ROCR device ${COORD_DEVICE}, layers ${COORD_LAYERS} plus local output head"
+echo "run.sh: starting coordinator on ROCR device ${COORD_DEVICE}, layers ${COORD_LAYERS}; final worker owns output head"
 COORD_ENV=(env
     -u DS4_DIST_DECODE_PROFILE
     DS4_ROCM_WEIGHT_ARENA_CHUNK_MB=256
