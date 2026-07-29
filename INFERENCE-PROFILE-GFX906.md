@@ -266,6 +266,141 @@ pipeline.
    l'1,39% nel decode; i trasferimenti tra worker valgono circa lo 0,9% del
    lavoro seriale del prefill.
 
+## Analisi della regressione Q8 nel decode
+
+Il 29 luglio 2026 è stato eseguito un confronto controllato per spiegare il
+calo osservato da circa 12-14 token/s a circa 8 token/s. Il test usa sempre lo
+stesso GGUF, lo split bilanciato `0:7 + 5x7`, `ctx=32768`, chunk 64, finestra 5,
+un prompt fisso da 3.105 token e 128 token greedy. Anche l'output head resta sul
+coordinatore in tutte le varianti.
+
+| Variante | Prefill | Decode 128 token | Throughput decode |
+|---|---:|---:|---:|
+| Commit storico `d2b5bea`, prima della regressione | 32,49 s | 10,49 s | 12,20 token/s |
+| Branch corrente senza correzione | 31,53 s | 16,00 s | 8,00 token/s |
+| Correzione Q8 gfx906, esecuzione 1 | 31,55 s | 10,41 s | 12,29 token/s |
+| Correzione Q8 gfx906, esecuzione 2 | 31,52 s | 10,41 s | 12,29 token/s |
+| Correzione Q8 gfx906 bit-exact finale | 31,50 s | 10,40 s | **12,31 token/s** |
+
+Rispetto allo stesso binario con la correzione disattivata, il throughput sale
+da 7,99 a 12,31 token/s, cioè **+54,1%**. La latenza di generazione scende da
+125,1 a 81,2 ms/token, cioè **-35,1%**. Il tempo di prefill cambia meno dello
+0,1% ed è quindi indistinguibile dal rumore della misura. La correzione recupera
+interamente la prestazione del commit storico equivalente (+0,9%).
+
+### Causa isolata
+
+Il confronto del codice individua la regressione nel commit upstream
+`ef8d923` (`Add ROCm GLM 5.2 support`). Quel commit ha rimosso il dispatch
+one-token che quantizzava una sola volta l'attivazione in Q8 e riutilizzava il
+risultato per tutte le righe di output. I kernel prequantizzati sono rimasti nel
+backend, ma il decode è passato sempre ai kernel con input F32. Questo percorso
+è più preciso in linea teorica, ma su Vega 20 `gfx906` ripete molto più lavoro
+per ogni riga, è sensibilmente più lento e, nel test asincrono esteso descritto
+sotto, espone anche una race numerica.
+
+La prova causale usa un singolo binario. Con
+`DS4_ROCM_DISABLE_Q8_PREQUANT_DECODE=1` lo stesso eseguibile torna a 7,99
+token/s e produce lo stesso JSON del branch non corretto; rimuovendo la
+variabile torna a 12,29-12,31 token/s. Non sono quindi responsabili né la
+posizione dell'output head, né lo split dei layer, né differenze di build.
+
+### Profilo interno prima e dopo
+
+Il profiler sincrono aggiunge overhead; i tempi seguenti sono la somma di
+quattro token e vanno usati per confrontare gli stadi, non come throughput
+normale. Le percentuali sono normalizzate separatamente sul totale interno di
+ciascuna variante.
+
+| Stadio | Prima | % prima | Dopo | % dopo | Variazione tempo |
+|---|---:|---:|---:|---:|---:|
+| Attention output Q8 | 117,80 ms | 22,84% | 34,99 ms | 9,86% | **-70,3%** |
+| Q path | 78,14 ms | 15,15% | 24,13 ms | 6,80% | **-69,1%** |
+| Shared expert gate/up | 37,79 ms | 7,33% | 13,85 ms | 3,90% | **-63,4%** |
+| Shared expert down | 19,61 ms | 3,80% | 8,52 ms | 2,40% | **-56,5%** |
+| Routed MoE | 59,86 ms | 11,61% | 62,42 ms | 17,59% | +4,3% |
+| Inverse RoPE/attention | 62,16 ms | 12,05% | 63,69 ms | 17,94% | +2,5% |
+| **Totale stadi interni** | **515,68 ms** | **100,00%** | **354,93 ms** | **100,00%** | **-31,2%** |
+
+I quattro stadi Q8 interessati scendono complessivamente da 253,34 a 81,48 ms,
+cioè **-67,8%**. Routed MoE, attenzione vera e propria, HC e router rimangono
+sostanzialmente invariati: la piccola oscillazione del profilo a quattro token
+non è correlata al recupero di throughput. Questo conferma che il collo di
+bottiglia regressivo non era la selezione o il calcolo degli esperti.
+
+### Forma della correzione e controlli di qualità
+
+La modifica è confinata al backend ROCm e attivata a compile time soltanto con
+`DS4_GFX906`; le altre architetture conservano il dispatch upstream. Inoltre:
+
+- il percorso prequantizzato resta attivo anche con `--quality`: il test esteso
+  ha mostrato che il percorso F32 asincrono può corrompere i logits su gfx906;
+- `DS4_ROCM_DISABLE_Q8_PREQUANT_DECODE=1` fornisce un rollback esclusivamente
+  diagnostico; per confronti numerici affidabili va usato con sincronizzazione
+  dei kernel (`AMD_SERIALIZE_KERNEL=3`);
+- la proiezione Q8 doppia quantizza l'attivazione una volta, ma usa due kernel
+  row-wise identici alle proiezioni singole, rispettando il contratto bit-exact;
+- la suite `--metal-kernels`, eseguita attraverso il backend ROCm gfx906, passa;
+- `make rocm-regression ROCM_ARCH=gfx906` passa, inclusi long-context smoke,
+  attenzione di riferimento, shim WMMA, packing Q8 wave64 e router wave64;
+- un vettore ufficiale model-backed (`short_code_completion`) passa sia con il
+  percorso ottimizzato sia con il rollback upstream, usando streaming SSD su
+  una singola GPU gfx906.
+
+Il percorso veloce quantizza le attivazioni Q8 e quindi non promette identità
+numerica con il percorso F32; una generazione lunga può divergere nei token per
+normale sensibilità autoregressiva. Il primo campione eseguito con streaming SSD
+è stato scartato: su prompt così brevi la prefill decode-style non era
+ripetibile. Il gate definitivo usa invece la stessa pipeline residente sulle
+sei gfx906 del benchmark (`0:7 + 5x7`, output sul worker finale), chunk 64,
+finestra 5 e attivazioni distribuite F16.
+
+La variante prequantizzata è stata eseguita due volte sulle prime 10
+continuazioni e i TSV risultanti sono **identici byte per byte**. Ha poi
+completato tutti i 100 casi ufficiali Flash, per 2.289 token target:
+
+| Metrica suite completa Q8 prequant | Valore |
+|---|---:|
+| Casi completati | **100/100** |
+| Token target | 2.289 |
+| NLL media | 0,367134 |
+| Primo token uguale all'ufficiale | 67/100 |
+| Top-1 API agreement | 86,151% |
+| Greedy longest common prefix medio | 6,55 token |
+| Top-N recall API | 32,075% |
+| Pairwise ranking agreement API | 98,862% |
+
+Il percorso F32 upstream, eseguito senza sincronizzazioni artificiali, fallisce
+in modo deterministico in `case_029` al token target 12 perché l'intero vettore
+dei logits diventa non finito. Lo stesso caso fallisce sia dopo i primi 29 casi
+sia isolato in una sessione nuova. Inserire un dump sincrono a ogni layer oppure
+impostare `AMD_SERIALIZE_KERNEL=3` lo fa passare: il comportamento identifica
+una race asincrona gfx906, non una variazione statistica del modello. Di
+conseguenza non esiste un risultato upstream valido sui 100 casi con cui fare
+un A/B completo non sincronizzato.
+
+Per separare la qualità dalla race è stato eseguito un confronto A/B
+sincronizzato sulle prime 10 continuazioni, 240 token totali. La sincronizzazione
+è applicata soltanto al rollback F32; la variante prequantizzata usa il percorso
+asincrono normale e ripetibile.
+
+| Metrica qualità | F32 sincronizzato | Q8 prequant gfx906 | Differenza |
+|---|---:|---:|---:|
+| NLL media | 0,363771 | 0,358652 | **-0,005119 (-1,41%)** |
+| Perplexity equivalente | 1,4387 | 1,4314 | **-0,51%** |
+| Casi vinti | 5 | 5 | parità |
+| Primo token uguale all'ufficiale | 7/10 | 7/10 | invariato |
+| Top-1 API agreement | 85,833% | 85,417% | -0,417 punti (1/240) |
+| Greedy longest common prefix medio | 7,4 token | 7,4 token | invariato |
+| Top-N recall API | 34,990% | 34,990% | invariato |
+| Pairwise ranking agreement API | 99,217% | 99,086% | -0,131 punti |
+
+Non emerge una perdita di qualità: la NLL e la perplexity migliorano
+leggermente, primo token e LCP restano invariati e la differenza top-1 riguarda
+un solo token su 240. Insieme al completamento deterministico della suite da
+100 casi, il risultato rende il percorso prequantizzato un miglioramento sia di
+throughput sia di robustezza su gfx906.
+
 ## Limiti della misura
 
 Queste percentuali descrivono la modalità residente e una posizione di

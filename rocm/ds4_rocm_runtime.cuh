@@ -4777,6 +4777,7 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
 
 struct ds4_rocm_runtime_config {
     int initialized;
+    int q8_prequant_decode;
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
@@ -4801,6 +4802,18 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
+#if defined(DS4_GFX906)
+        /* Vega 20 has substantially higher one-token Q8 throughput when the
+         * activation is quantized once and reused by all output rows.  The
+         * F32-input path can also expose asynchronous wave64 corruption, so
+         * keep this enabled in quality mode; the environment switch remains
+         * available for controlled diagnostics.  Other architectures retain
+         * the upstream dispatch. */
+        g_rocm_cfg.q8_prequant_decode =
+            !cuda_env_present(getenv("DS4_ROCM_DISABLE_Q8_PREQUANT_DECODE"));
+#else
+        g_rocm_cfg.q8_prequant_decode = 0;
+#endif
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
