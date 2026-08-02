@@ -375,6 +375,10 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--step-mul F", "Multiplicative step. Default: 1");
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "--mtp FILE", "Optional DSpark support GGUF.");
+    opt(fp, c, "--dspark", "Enable DSpark speculative decode with --mtp.");
+    opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1. Default: 0.9");
+    opt(fp, c, "--show-output", "Print generated token IDs and decoded text.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);

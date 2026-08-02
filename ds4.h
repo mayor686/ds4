@@ -434,6 +434,34 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen);
+/* Distributed speculative-decode helpers. A speculative block snapshots only
+ * the compressor/indexer frontiers owned by this slice; raw KV rows are a
+ * position-addressed ring and are overwritten by a partial-accept replay. */
+int ds4_session_layer_slice_spec_begin(ds4_session *s,
+                                       uint32_t layer_start,
+                                       uint32_t layer_end,
+                                       char *err,
+                                       size_t errlen);
+int ds4_session_layer_slice_spec_rollback(ds4_session *s,
+                                          char *err,
+                                          size_t errlen);
+void ds4_session_layer_slice_spec_commit(ds4_session *s);
+/* Compute target top-1 values for rows [0,n_tokens-2] and return the full
+ * logits of the last row. Call immediately after a batched final-layer slice. */
+int ds4_session_layer_slice_verify_tops(ds4_session *s,
+                                        uint32_t n_tokens,
+                                        int *row_tops,
+                                        float *last_logits,
+                                        char *err,
+                                        size_t errlen);
+/* Build a DSpark proposal from the target-hidden capture produced by the last
+ * layer-slice evaluation. Returns zero when this worker has no DSpark support. */
+int ds4_session_layer_slice_dspark_propose(ds4_session *s,
+                                           int token,
+                                           int *drafts,
+                                           int drafts_cap,
+                                           char *err,
+                                           size_t errlen);
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
                                          uint32_t n_tokens,

@@ -56,12 +56,20 @@
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
+#define DS4_DIST_WORK_F_SPEC_VERIFY 0x00000010u
+#define DS4_DIST_WORK_F_SPEC_ROLLBACK 0x00000020u
+#define DS4_DIST_WORK_F_DSPARK_PROBE 0x00000040u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
-     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY)
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_SPEC_ROLLBACK | \
+     DS4_DIST_WORK_F_DSPARK_PROBE)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
+#define DS4_DIST_RESULT_DSPARK_PROPOSAL 3u
+#define DS4_DIST_RESULT_SPEC_VERIFY 4u
+#define DS4_DIST_DSPARK_MAX_DRAFTS 16u
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
@@ -395,6 +403,15 @@ struct ds4_dist_session {
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    uint64_t dspark_cycles;
+    uint64_t dspark_proposed;
+    uint64_t dspark_accepted;
+    uint64_t dspark_calls;
+    uint64_t dspark_no_draft;
+    uint64_t dspark_first_misses;
+    double dspark_probe_ms;
+    double dspark_verify_ms;
+    double dspark_rollback_ms;
 };
 
 typedef struct {
@@ -2503,6 +2520,7 @@ static int dist_coordinator_send_remote_work_on_fd(
         uint64_t result_hash,
         bool reset_session,
         bool ack_only,
+        uint32_t extra_flags,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         char *err,
@@ -2527,6 +2545,9 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.flags = DS4_DIST_WORK_F_INPUT_HC;
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
+    work.flags |= extra_flags & (DS4_DIST_WORK_F_SPEC_VERIFY |
+                                 DS4_DIST_WORK_F_SPEC_ROLLBACK |
+                                 DS4_DIST_WORK_F_DSPARK_PROBE);
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         work.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
     }
@@ -2564,14 +2585,20 @@ static int dist_coordinator_eval_remote_on_fd(
         uint64_t prefix_hash,
         uint64_t expected_result_hash,
         bool reset_session,
+        uint32_t extra_flags,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         float *logits,
+        int *drafts,
+        uint32_t *draft_count,
+        int *row_tops,
+        uint32_t row_tops_cap,
         char *err,
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
     const double send_t0 = profile ? dist_now_sec() : 0.0;
+    if (draft_count) *draft_count = 0;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
                                                      plan,
                                                      fd,
@@ -2584,6 +2611,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      expected_result_hash,
                                                      reset_session,
                                                      false,
+                                                     extra_flags,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -2637,6 +2665,64 @@ static int dist_coordinator_eval_remote_on_fd(
         }
         return 0;
     }
+    if (kind == DS4_DIST_RESULT_DSPARK_PROPOSAL &&
+        payload_bytes >= sizeof(uint32_t) + logits_bytes) {
+        const uint8_t *p = payload;
+        uint32_t wire_count = 0;
+        memcpy(&wire_count, p, sizeof(wire_count));
+        const uint32_t count = ntohl(wire_count);
+        const uint64_t expected = sizeof(uint32_t) +
+            (uint64_t)count * sizeof(uint32_t) + logits_bytes;
+        if (count <= DS4_DIST_DSPARK_MAX_DRAFTS &&
+            expected == payload_bytes &&
+            (!count || (drafts && draft_count))) {
+            p += sizeof(uint32_t);
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t wire_token = 0;
+                memcpy(&wire_token,
+                       p + (uint64_t)i * sizeof(wire_token),
+                       sizeof(wire_token));
+                drafts[i] = (int)ntohl(wire_token);
+            }
+            p += (uint64_t)count * sizeof(uint32_t);
+            memcpy(logits, p, logits_bytes);
+            if (draft_count) *draft_count = count;
+            free(payload);
+            return 0;
+        }
+        free(payload);
+        if (errlen) snprintf(err, errlen,
+                             "invalid distributed DSpark proposal payload");
+        return 1;
+    }
+    if (kind == DS4_DIST_RESULT_SPEC_VERIFY &&
+        payload_bytes >= sizeof(uint32_t) + logits_bytes) {
+        const uint8_t *p = payload;
+        uint32_t wire_count = 0;
+        memcpy(&wire_count, p, sizeof(wire_count));
+        const uint32_t count = ntohl(wire_count);
+        const uint64_t expected = sizeof(uint32_t) +
+            (uint64_t)count * sizeof(uint32_t) + logits_bytes;
+        if (count <= row_tops_cap && expected == payload_bytes &&
+            (!count || row_tops)) {
+            p += sizeof(uint32_t);
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t wire_token = 0;
+                memcpy(&wire_token,
+                       p + (uint64_t)i * sizeof(wire_token),
+                       sizeof(wire_token));
+                row_tops[i] = (int)ntohl(wire_token);
+            }
+            p += (uint64_t)count * sizeof(uint32_t);
+            memcpy(logits, p, logits_bytes);
+            free(payload);
+            return 0;
+        }
+        free(payload);
+        if (errlen) snprintf(err, errlen,
+                             "invalid distributed speculative verifier payload");
+        return 1;
+    }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
         const double head_t0 = profile ? dist_now_sec() : 0.0;
         int head_rc = ds4_session_eval_output_head_from_hc(session,
@@ -2677,7 +2763,12 @@ static int dist_coordinator_eval_span(
         uint64_t session_id,
         uint64_t request_id,
         bool reset_session,
+        uint32_t extra_flags,
         float *logits,
+        int *drafts,
+        uint32_t *draft_count,
+        int *row_tops,
+        uint32_t row_tops_cap,
         char *err,
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
@@ -2710,6 +2801,23 @@ static int dist_coordinator_eval_span(
             if (errlen) snprintf(err, errlen, "out of memory allocating coordinator hidden-state");
             return 1;
         }
+    }
+    if ((extra_flags & DS4_DIST_WORK_F_SPEC_ROLLBACK) != 0) {
+        if (ds4_session_layer_slice_spec_rollback(session, err, errlen) != 0) {
+            free(hidden);
+            return 1;
+        }
+    } else if ((extra_flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0) {
+        if (ds4_session_layer_slice_spec_begin(session,
+                                               state->local_start,
+                                               state->local_end,
+                                               err,
+                                               errlen) != 0) {
+            free(hidden);
+            return 1;
+        }
+    } else {
+        ds4_session_layer_slice_spec_commit(session);
     }
     if (reset_session &&
         ds4_session_layer_slice_reset(session, err, errlen) != 0) {
@@ -2758,12 +2866,21 @@ static int dist_coordinator_eval_span(
                                                 prefix_hash,
                                                 result_hash,
                                                 reset_session,
+                                                extra_flags,
                                                 hidden,
                                                 hidden_bytes,
                                                 logits,
+                                                drafts,
+                                                draft_count,
+                                                row_tops,
+                                                row_tops_cap,
                                                 err,
                                                 errlen);
         remote_t1 = profile ? dist_now_sec() : 0.0;
+    }
+    if (rc == 0 &&
+        (extra_flags & DS4_DIST_WORK_F_SPEC_ROLLBACK) != 0) {
+        ds4_session_layer_slice_spec_commit(session);
     }
     if (profile) {
         const double span_t1 = dist_now_sec();
@@ -3055,7 +3172,9 @@ static int dist_write_logprobs_dump(
         if (dist_coordinator_eval_span(state, session, plan,
                                        &token, 1, token_pos,
                                        session_id, (*request_id)++,
-                                       false, logits, err, sizeof(err)) != 0) {
+                                       false, 0, logits,
+                                       NULL, NULL, NULL, 0,
+                                       err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "ds4: distributed decode failed while dumping logprobs: %s\n",
                     err);
@@ -3231,6 +3350,7 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
+                                                         0,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
                                                          send_err,
@@ -3815,7 +3935,9 @@ static int dist_coordinator_prefill_prompt(
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
-                                                 pos == 0, logits, err, errlen);
+                                                 pos == 0, 0, logits,
+                                                 NULL, NULL, NULL, 0,
+                                                 err, errlen);
         if (eval_rc != 0) {
             return eval_rc;
         }
@@ -4054,7 +4176,9 @@ static int dist_run_coordinator_generation(
         int decode_rc = dist_coordinator_eval_span(state, session, &plan,
                                                    &token, 1, token_pos,
                                                    session_id, request_id++,
-                                                   false, logits, err, sizeof(err));
+                                                   false, 0, logits,
+                                                   NULL, NULL, NULL, 0,
+                                                   err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
             if (dist_coordinator_rebuild_from_transcript(state,
@@ -5482,6 +5606,34 @@ int ds4_dist_session_create(
 
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
+    if (getenv("DS4_DSPARK_STATS") != NULL && d->dspark_calls != 0) {
+        const double total_ms = d->dspark_probe_ms +
+                                d->dspark_verify_ms +
+                                d->dspark_rollback_ms;
+        fprintf(stderr,
+                "ds4: distributed DSpark stats calls=%llu cycles=%llu "
+                "no_draft=%llu first_miss=%llu proposed=%llu accepted=%llu "
+                "accept_rate=%.2f%% time_ms target_plus_propose=%.3f "
+                "verify=%.3f rollback=%.3f total=%.3f "
+                "phase_pct target_plus_propose=%.2f verify=%.2f rollback=%.2f\n",
+                (unsigned long long)d->dspark_calls,
+                (unsigned long long)d->dspark_cycles,
+                (unsigned long long)d->dspark_no_draft,
+                (unsigned long long)d->dspark_first_misses,
+                (unsigned long long)d->dspark_proposed,
+                (unsigned long long)d->dspark_accepted,
+                d->dspark_proposed
+                    ? 100.0 * (double)d->dspark_accepted /
+                          (double)d->dspark_proposed
+                    : 0.0,
+                d->dspark_probe_ms,
+                d->dspark_verify_ms,
+                d->dspark_rollback_ms,
+                total_ms,
+                total_ms > 0.0 ? 100.0 * d->dspark_probe_ms / total_ms : 0.0,
+                total_ms > 0.0 ? 100.0 * d->dspark_verify_ms / total_ms : 0.0,
+                total_ms > 0.0 ? 100.0 * d->dspark_rollback_ms / total_ms : 0.0);
+    }
     if (d->listen_fd >= 0) {
         shutdown(d->listen_fd, SHUT_RDWR);
         close(d->listen_fd);
@@ -5589,7 +5741,12 @@ int ds4_dist_session_sync(
                                                      d->session_id,
                                                      d->request_id++,
                                                      false,
+                                                     0,
                                                      logits,
+                                                     NULL,
+                                                     NULL,
+                                                     NULL,
+                                                     0,
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
@@ -5670,7 +5827,12 @@ int ds4_dist_session_eval(
                                         d->session_id,
                                         d->request_id++,
                                         false,
+                                        0,
                                         logits,
+                                        NULL,
+                                        NULL,
+                                        NULL,
+                                        0,
                                         err,
                                         errlen);
     if (rc != 0) {
@@ -5698,6 +5860,161 @@ int ds4_dist_session_eval(
         rc = 0;
     }
     return rc;
+}
+
+int ds4_dist_session_eval_speculative_argmax(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        int first_token,
+        int max_tokens,
+        int eos_token,
+        int *accepted,
+        int accepted_cap,
+        float *logits,
+        char *err,
+        size_t errlen) {
+    if (!d || !owner || !checkpoint || checkpoint->len < 0 ||
+        !accepted || accepted_cap <= 0 || max_tokens <= 0 || !logits) {
+        if (errlen) snprintf(err, errlen,
+                             "invalid distributed speculative decode request");
+        return -1;
+    }
+    if (dist_session_ensure_route(d, err, errlen) != 0) return -1;
+
+    const double cycle_t0 = dist_now_sec();
+    const uint32_t first_pos = (uint32_t)checkpoint->len;
+    int drafts[DS4_DIST_DSPARK_MAX_DRAFTS];
+    int row_tops[DS4_DIST_DSPARK_MAX_DRAFTS];
+    uint32_t draft_count = 0;
+    int rc = dist_coordinator_eval_span(&d->state,
+                                        owner,
+                                        &d->plan,
+                                        &first_token,
+                                        1,
+                                        first_pos,
+                                        d->session_id,
+                                        d->request_id++,
+                                        false,
+                                        DS4_DIST_WORK_F_DSPARK_PROBE,
+                                        logits,
+                                        drafts,
+                                        &draft_count,
+                                        NULL,
+                                        0,
+                                        err,
+                                        errlen);
+    if (rc != 0) return -1;
+    const double probe_done = dist_now_sec();
+    d->dspark_calls++;
+    d->dspark_probe_ms += (probe_done - cycle_t0) * 1000.0;
+
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 ||
+        n_accept >= accepted_cap || draft_count == 0) {
+        if (draft_count == 0) d->dspark_no_draft++;
+        return n_accept;
+    }
+
+    uint32_t draft_n = draft_count;
+    const uint32_t max_more = (uint32_t)(max_tokens - n_accept);
+    const uint32_t cap_more = (uint32_t)(accepted_cap - n_accept);
+    if (draft_n > max_more) draft_n = max_more;
+    if (draft_n > cap_more) draft_n = cap_more;
+    const int room = ds4_session_ctx(owner) - ds4_session_pos(owner);
+    if (room <= 1) return n_accept;
+    if (draft_n > (uint32_t)(room - 1)) draft_n = (uint32_t)(room - 1);
+    if (draft_n == 0) return n_accept;
+
+    const int target_top = dist_logits_argmax(
+            logits, ds4_engine_vocab_size(d->state.engine));
+    if (drafts[0] != target_top) {
+        d->dspark_cycles++;
+        d->dspark_proposed += draft_n;
+        d->dspark_first_misses++;
+        return n_accept;
+    }
+    if (drafts[0] == eos_token) draft_n = 1;
+
+    const uint32_t verify_pos = (uint32_t)ds4_session_pos(owner);
+    const double verify_t0 = dist_now_sec();
+    rc = dist_coordinator_eval_span(&d->state,
+                                    owner,
+                                    &d->plan,
+                                    drafts,
+                                    draft_n,
+                                    verify_pos,
+                                    d->session_id,
+                                    d->request_id++,
+                                    false,
+                                    DS4_DIST_WORK_F_SPEC_VERIFY,
+                                    logits,
+                                    NULL,
+                                    NULL,
+                                    row_tops,
+                                    draft_n > 0 ? draft_n - 1u : 0u,
+                                    err,
+                                    errlen);
+    if (rc != 0) return -1;
+    const double verify_done = dist_now_sec();
+    d->dspark_verify_ms += (verify_done - verify_t0) * 1000.0;
+
+    uint32_t commit = 1;
+    for (uint32_t i = 1; i < draft_n; i++) {
+        if (row_tops[i - 1u] != drafts[i]) break;
+        commit++;
+    }
+
+    if (commit == draft_n) {
+        ds4_session_layer_slice_spec_commit(owner);
+    } else {
+        const double rollback_t0 = dist_now_sec();
+        rc = dist_coordinator_eval_span(&d->state,
+                                        owner,
+                                        &d->plan,
+                                        drafts,
+                                        commit,
+                                        verify_pos,
+                                        d->session_id,
+                                        d->request_id++,
+                                        false,
+                                        DS4_DIST_WORK_F_SPEC_ROLLBACK,
+                                        logits,
+                                        NULL,
+                                        NULL,
+                                        NULL,
+                                        0,
+                                        err,
+                                        errlen);
+        if (rc != 0) return -1;
+        d->dspark_rollback_ms +=
+            (dist_now_sec() - rollback_t0) * 1000.0;
+    }
+
+    for (uint32_t i = 0; i < commit && n_accept < accepted_cap; i++) {
+        accepted[n_accept++] = drafts[i];
+        if (drafts[i] == eos_token) break;
+    }
+    d->dspark_cycles++;
+    d->dspark_proposed += draft_n;
+    d->dspark_accepted += commit;
+    if (getenv("DS4_DSPARK_STATS") != NULL) {
+        fprintf(stderr,
+                "ds4: distributed DSpark cycle=%llu proposed=%u accepted=%u "
+                "rate=%.1f%% lifetime=%llu/%llu (%.1f%%)\n",
+                (unsigned long long)d->dspark_cycles,
+                draft_n,
+                commit,
+                draft_n ? 100.0 * (double)commit / (double)draft_n : 0.0,
+                (unsigned long long)d->dspark_accepted,
+                (unsigned long long)d->dspark_proposed,
+                d->dspark_proposed
+                    ? 100.0 * (double)d->dspark_accepted /
+                          (double)d->dspark_proposed
+                    : 0.0);
+    }
+    return n_accept;
 }
 
 /* =========================================================================
@@ -7235,6 +7552,19 @@ static int dist_worker_process_work_payload(
     const bool output_logits = (work.flags & DS4_DIST_WORK_F_OUTPUT_LOGITS) != 0;
     const bool input_hc_present = (work.flags & DS4_DIST_WORK_F_INPUT_HC) != 0;
     const bool ack_only = (work.flags & DS4_DIST_WORK_F_ACK_ONLY) != 0;
+    const bool spec_verify =
+        (work.flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0;
+    const bool spec_rollback =
+        (work.flags & DS4_DIST_WORK_F_SPEC_ROLLBACK) != 0;
+    const bool dspark_probe =
+        (work.flags & DS4_DIST_WORK_F_DSPARK_PROBE) != 0;
+    if ((spec_verify && spec_rollback) ||
+        (spec_verify && dspark_probe) ||
+        (spec_verify && work.n_tokens > DS4_DIST_DSPARK_MAX_DRAFTS)) {
+        return dist_worker_upstream_send_work_error(
+                upstream, request_id,
+                "invalid distributed speculative WORK flags");
+    }
     if (input_hc_present && work.layer_start == 0) {
         return dist_worker_upstream_send_work_error(upstream, request_id, "layer 0 WORK must not provide input hidden-state");
     }
@@ -7398,21 +7728,46 @@ static int dist_worker_process_work_payload(
     }
 
     const bool final_ack_only = ack_only && !has_next;
-    const bool local_output_logits = output_logits && !has_next && !final_ack_only;
-    const bool produce_hidden = !local_output_logits && !final_ack_only;
-    const uint32_t result_kind = final_ack_only
+    const bool spec_final =
+        spec_verify && output_logits && !has_next && !final_ack_only;
+    const bool proposal_final =
+        dspark_probe && output_logits && !has_next && !final_ack_only;
+    const bool local_output_logits =
+        output_logits && !has_next && !final_ack_only &&
+        !spec_final && !proposal_final;
+    const bool produce_hidden =
+        !local_output_logits && !spec_final && !proposal_final &&
+        !final_ack_only;
+    uint32_t result_kind = final_ack_only
         ? DS4_DIST_RESULT_ACK
-        : (local_output_logits ? DS4_DIST_RESULT_LOGITS : DS4_DIST_RESULT_HIDDEN_STATE);
-    const uint32_t result_bytes = final_ack_only
+        : (spec_final ? DS4_DIST_RESULT_SPEC_VERIFY
+           : (proposal_final ? DS4_DIST_RESULT_DSPARK_PROPOSAL
+              : (local_output_logits ? DS4_DIST_RESULT_LOGITS
+                 : DS4_DIST_RESULT_HIDDEN_STATE)));
+    const uint32_t logits_bytes = (uint32_t)(
+        (uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
+    uint32_t result_bytes = final_ack_only
         ? 0u
-        : (local_output_logits
-            ? (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float))
-            : expected_hc_bytes);
+        : ((spec_final || proposal_final)
+            ? sizeof(uint32_t) +
+              DS4_DIST_DSPARK_MAX_DRAFTS * sizeof(uint32_t) + logits_bytes
+            : (local_output_logits ? logits_bytes : expected_hc_bytes));
     float *result = result_bytes ? malloc(result_bytes) : NULL;
+    float *custom_logits =
+        (spec_final || proposal_final) ? malloc(logits_bytes) : NULL;
     if (result_bytes && !result) {
+        free(custom_logits);
         free(route_blob);
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "out of memory allocating distributed result");
+    }
+    if ((spec_final || proposal_final) && !custom_logits) {
+        free(result);
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(
+                upstream, request_id,
+                "out of memory allocating speculative logits");
     }
 
     const double decode_t0 = profile ? dist_now_sec() : 0.0;
@@ -7453,6 +7808,41 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
+    if (spec_rollback) {
+        if (ds4_session_layer_slice_spec_rollback(session->session,
+                                                  err,
+                                                  sizeof(err)) != 0) {
+            pthread_mutex_unlock(&state->mu);
+            if (!input_hc_uses_wire) free(input_hc);
+            free(custom_logits);
+            free(result);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream,
+                                                        request_id,
+                                                        err);
+        }
+        session->token_hash = work_prefix_hash;
+        session->token_hash_valid = true;
+    } else if (spec_verify) {
+        if (ds4_session_layer_slice_spec_begin(session->session,
+                                               work.layer_start,
+                                               work.layer_end,
+                                               err,
+                                               sizeof(err)) != 0) {
+            pthread_mutex_unlock(&state->mu);
+            if (!input_hc_uses_wire) free(input_hc);
+            free(custom_logits);
+            free(result);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream,
+                                                        request_id,
+                                                        err);
+        }
+    } else {
+        ds4_session_layer_slice_spec_commit(session->session);
+    }
     if ((work.flags & DS4_DIST_WORK_F_RESET_SESSION) != 0 &&
         ds4_session_layer_slice_reset(session->session, err, sizeof(err)) != 0) {
         pthread_mutex_unlock(&state->mu);
@@ -7486,6 +7876,10 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
+    int speculative_values[DS4_DIST_DSPARK_MAX_DRAFTS];
+    uint32_t speculative_count = 0;
+    const bool eval_output_logits = local_output_logits || proposal_final;
+    float *eval_logits = local_output_logits ? result : custom_logits;
     const double eval_t0 = dist_now_sec();
     int eval_rc = ds4_session_eval_layer_slice(session->session,
                                                tokens,
@@ -7495,10 +7889,49 @@ static int dist_worker_process_work_payload(
                                                work.layer_end,
                                                input_hc,
                                                produce_hidden ? result : NULL,
-                                               local_output_logits,
-                                               local_output_logits ? result : NULL,
+                                               eval_output_logits,
+                                               eval_output_logits ? eval_logits : NULL,
                                                err,
                                                sizeof(err));
+    if (eval_rc == 0 && spec_final) {
+        speculative_count = work.n_tokens > 1 ? work.n_tokens - 1u : 0u;
+        eval_rc = ds4_session_layer_slice_verify_tops(
+                session->session,
+                work.n_tokens,
+                speculative_values,
+                custom_logits,
+                err,
+                sizeof(err));
+    } else if (eval_rc == 0 && proposal_final) {
+        const int proposed = ds4_session_layer_slice_dspark_propose(
+                session->session,
+                tokens[work.n_tokens - 1u],
+                speculative_values,
+                (int)DS4_DIST_DSPARK_MAX_DRAFTS,
+                err,
+                sizeof(err));
+        if (proposed < 0) eval_rc = 1;
+        else speculative_count = (uint32_t)proposed;
+    }
+    if (eval_rc == 0 && (spec_final || proposal_final)) {
+        uint8_t *p = (uint8_t *)result;
+        const uint32_t wire_count = htonl(speculative_count);
+        memcpy(p, &wire_count, sizeof(wire_count));
+        p += sizeof(wire_count);
+        for (uint32_t i = 0; i < speculative_count; i++) {
+            const uint32_t wire_token = htonl((uint32_t)speculative_values[i]);
+            memcpy(p + (uint64_t)i * sizeof(wire_token),
+                   &wire_token,
+                   sizeof(wire_token));
+        }
+        p += (uint64_t)speculative_count * sizeof(uint32_t);
+        memcpy(p, custom_logits, logits_bytes);
+        result_bytes = sizeof(uint32_t) +
+            speculative_count * sizeof(uint32_t) + logits_bytes;
+    }
+    if (eval_rc == 0 && spec_rollback) {
+        ds4_session_layer_slice_spec_commit(session->session);
+    }
     const double eval_t1 = dist_now_sec();
     if (eval_rc == 0) {
         session->token_hash = work_result_hash;
@@ -7507,6 +7940,7 @@ static int dist_worker_process_work_payload(
         session->token_hash_valid = false;
     }
     pthread_mutex_unlock(&state->mu);
+    free(custom_logits);
     DIST_DEBUG("worker eval request=%llu layers=%u:%u tokens=%u pos=%u has_next=%d output=%d rc=%d",
                (unsigned long long)request_id,
                work.layer_start,

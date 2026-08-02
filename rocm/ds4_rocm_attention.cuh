@@ -8,6 +8,83 @@
 #define DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP \
     (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
 
+/* Non-causal batch attention over the raw KV ring used by DSpark's draft
+ * blocks.  Unlike the target-model decode kernels, each draft query attends
+ * to the complete visible support window. */
+__global__ static void attention_noncausal_raw_batch_heads_kernel(
+        float       *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t     n_tokens,
+        uint32_t     n_raw,
+        uint32_t     raw_cap,
+        uint32_t     raw_start,
+        uint32_t     n_head,
+        uint32_t     head_dim) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (tok >= n_tokens || h >= n_head) return;
+
+    extern __shared__ float scores[];
+    __shared__ float partial[256];
+    __shared__ float max_score;
+    __shared__ float denominator;
+
+    const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+    float local_max = sinks[h];
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        const uint32_t row = (raw_start + r) % raw_cap;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+        const float score = dot * scale;
+        scores[r] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_score = partial[0];
+    __syncthreads();
+
+    float local_den = 0.0f;
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        const float probability = expf(scores[r] - max_score);
+        scores[r] = probability;
+        local_den += probability;
+    }
+    partial[threadIdx.x] = local_den;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        denominator = partial[0] + expf(sinks[h] - max_score);
+    }
+    __syncthreads();
+
+    float *out = heads + ((uint64_t)tok * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float value = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = (raw_start + r) % raw_cap;
+            value += raw_kv[(uint64_t)row * head_dim + d] * scores[r];
+        }
+        out[d] = value / denominator;
+    }
+}
+
 __global__ static void attention_prefill_raw_kernel(
         float *heads,
         const float *sinks,

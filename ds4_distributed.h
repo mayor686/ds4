@@ -100,6 +100,21 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* Greedy distributed DSpark cycle. The final worker owns the support model
+ * and returns a proposal; all stages verify the suffix as one tiny batch. */
+int ds4_dist_session_eval_speculative_argmax(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        int first_token,
+        int max_tokens,
+        int eos_token,
+        int *accepted,
+        int accepted_cap,
+        float *logits,
+        char *err,
+        size_t errlen);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

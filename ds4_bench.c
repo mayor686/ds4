@@ -27,6 +27,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -49,6 +50,7 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
+    float dspark_confidence_threshold;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
@@ -57,6 +59,8 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
+    bool dspark;
+    bool dspark_confidence_threshold_set;
     bool show_output;
 } bench_config;
 
@@ -236,6 +240,21 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark = true;
+        } else if (!strcmp(arg, "--dspark-confidence") ||
+                   !strcmp(arg, "--dspark-confidence-threshold")) {
+            const double v = parse_double_arg(
+                    need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1.0) {
+                fprintf(stderr,
+                        "ds4-bench: --dspark-confidence-threshold must be between 0 and 1\n");
+                exit(2);
+            }
+            c.dspark_confidence_threshold = (float)v;
+            c.dspark_confidence_threshold_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -337,6 +356,10 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.dspark && (!c.mtp_path || !c.mtp_path[0])) {
+        fprintf(stderr, "ds4-bench: --dspark requires --mtp FILE\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -576,6 +599,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -588,6 +612,10 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .dspark = cfg.dspark,
+        .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
+        .dspark_confidence_threshold_set =
+            cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
@@ -732,12 +760,13 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -750,19 +779,52 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            int accepted[16];
+            int accepted_n = 1;
+            if (cfg.dspark) {
+                int remaining = cfg.gen_tokens - gen_done;
+                if (remaining > (int)(sizeof(accepted) / sizeof(accepted[0]))) {
+                    remaining = (int)(sizeof(accepted) / sizeof(accepted[0]));
+                }
+                accepted_n = ds4_session_eval_speculative_argmax(
+                        session,
+                        token,
+                        remaining,
+                        -1,
+                        accepted,
+                        remaining,
+                        err,
+                        sizeof(err));
+            } else if (ds4_session_eval(session, token,
+                                        err, sizeof(err)) == 0) {
+                accepted[0] = token;
+            } else {
+                accepted_n = -1;
+            }
+            if (accepted_n <= 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            if (gen_done == 0) {
+                gen_first_sec = token_t1 - token_t0;
+                gen_first_tokens = accepted_n;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+            }
+            for (int j = 0; j < accepted_n; j++) {
+                if (gen_token_buf) gen_token_buf[gen_token_count++] = accepted[j];
+                gen_done++;
+            }
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] token ids:", frontier);
+            for (int i = 0; i < gen_token_count; i++) {
+                fprintf(stderr, " %d", gen_token_buf[i]);
+            }
+            fputc('\n', stderr);
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {
                 size_t tlen = 0;
@@ -795,7 +857,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens =
+            gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,
