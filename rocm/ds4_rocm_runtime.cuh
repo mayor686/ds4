@@ -21,6 +21,7 @@ static int g_cublas_ready;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
+static int g_glm_model;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
@@ -4812,7 +4813,18 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.q8_prequant_decode =
             !cuda_env_present(getenv("DS4_ROCM_DISABLE_Q8_PREQUANT_DECODE"));
 #else
-        g_rocm_cfg.q8_prequant_decode = 0;
+        const char *dsv4_prequant_env =
+            getenv("DS4_ROCM_DSV4_PREQUANT_DECODE");
+        /*
+         * DeepSeek V4 used the prequantized Q8 decode kernels before ROCm
+         * GLM support landed.  They are substantially faster on gfx1151.
+         * Keep GLM and --quality on the current full-F32 activation path.
+         * An explicit =0 remains available as a diagnostic rollback.
+         */
+        g_rocm_cfg.q8_prequant_decode =
+            !g_quality_mode &&
+            (dsv4_prequant_env == NULL ||
+             cuda_env_present(dsv4_prequant_env));
 #endif
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
@@ -4905,6 +4917,10 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.initialized = 1;
     }
     return &g_rocm_cfg;
+}
+
+static bool cuda_q8_prequant_decode_enabled(void) {
+    return !g_glm_model && cuda_runtime_config()->q8_prequant_decode;
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
@@ -5594,10 +5610,15 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     if (mb < 256) mb = 256;
     if (mb > 8192) mb = 8192;
     uint64_t bytes = mb * 1048576ull;
-    if (need > bytes / 2u) {
-        const uint64_t align = 64ull * 1048576ull;
-        return (need + align - 1u) & ~(align - 1u);
-    }
+    /*
+     * Two allocations larger than half the selected arena can never share it.
+     * Allocate those spans tightly for DeepSeek instead of stranding the
+     * remainder.  This matters for Q4 expert spans (1152 MiB), where the
+     * default policy otherwise wastes 640 MiB per tensor span.
+     *
+     * Keep GLM on its existing allocation policy.
+     */
+    if (!g_glm_model && need > bytes / 2u) return need;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
