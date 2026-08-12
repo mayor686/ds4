@@ -107,6 +107,12 @@ modes for the same arithmetic prompt.
 - Pack two Q8 logical rows per wave64 and tune F16-pair workgroups for 60 CUs.
 - Map a router row to one native wave64, retaining existing paths elsewhere.
 - Use cooperative score dots only for the measured short-cache range.
+- Increase one-token IQ2 gate/up occupancy from 96 to 384 workgroups on gfx906
+  while preserving each output row's reduction order.
+- Transpose only the selected indexed-attention K rows for coalesced Q·K reads,
+  retaining the original V layout and FP32 accumulation order.
+- Fuse indexed-attention inverse RoPE into the final attention workgroup; the
+  ROCm regression verifies bit-identical output against the separate kernel.
 - Make the ROCm weight-arena chunk configurable.
 - Allocate raw, compressed-attention, indexer, and compressor-frontier KV only
   for the layer range owned by the local distributed process.
@@ -134,6 +140,9 @@ ROCR_VISIBLE_DEVICES=2 make rocm-regression \
     ROCM_ARCH=gfx906                                 PASS
   top-k n_comp=32768, n_tokens=32                   PASS
   attention ring reference max_abs=2.60e-7          PASS
+  indexed attention 16K: 1.347 ms -> 0.382 ms       PASS
+  indexed stable/transpose max_abs=9.31e-10         PASS
+  indexed fused-RoPE max_abs=0, RMS=0               PASS
   gfx906 WMMA: 256 tiles / 8192 values, max_err=0   PASS
   Q8 wave64 packing: 4097 rows, 0 mismatches        PASS
   F16-pair sizing: 513 rows, 0 mismatches           PASS

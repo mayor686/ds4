@@ -1084,6 +1084,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_split_kernel(
     }
 }
 
+template <uint32_t rows_per_group>
 __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -1103,6 +1104,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float clamp) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t row_groups = blockDim.x >> 3u;
     uint32_t pair = blockIdx.y;
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
@@ -1110,9 +1112,10 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) {
         if (lane == 0) {
-            for (uint32_t rr = 0; rr < 4u; rr++) {
+            for (uint32_t rr = 0; rr < rows_per_group; rr++) {
                 const uint32_t row =
-                    blockIdx.x * 128u + row_lane + rr * 32u;
+                    blockIdx.x * (row_groups * rows_per_group) +
+                    row_lane + rr * row_groups;
                 if (row >= expert_mid_dim) continue;
                 const uint64_t off =
                     (uint64_t)pair * expert_mid_dim + row;
@@ -1137,8 +1140,9 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
     if (xq_blocks <= 16u) xqb = sxq;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < rows_per_group; rr++) {
+        uint32_t row = blockIdx.x * (row_groups * rows_per_group) +
+                       row_lane + rr * row_groups;
         if (row >= expert_mid_dim) continue;
         const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);

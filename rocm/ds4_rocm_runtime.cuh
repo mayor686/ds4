@@ -4803,6 +4803,7 @@ struct ds4_rocm_runtime_config {
     int graph_dump;
     int router_wave64;
     int attention_cooperative_dot;
+    int attention_indexed_transpose;
     uint32_t q8_decode_rpb;
     uint32_t f16_pair_decode_rpb;
     uint32_t q8_hc_decode_rpb;
@@ -4814,6 +4815,48 @@ struct ds4_rocm_runtime_config {
 };
 
 static ds4_rocm_runtime_config g_rocm_cfg;
+
+struct ds4_rocm_decode_attn_rope_config {
+    int armed;
+    int used;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t pos0;
+    uint32_t n_ctx_orig;
+    int inverse;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
+static ds4_rocm_decode_attn_rope_config g_rocm_decode_attn_rope;
+
+extern "C" int ds4_gpu_decode_attn_rope_fuse_available(void) {
+#if defined(DS4_GFX906)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+extern "C" void ds4_gpu_set_decode_attn_rope_fuse(
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t n_ctx_orig, bool inverse, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    g_rocm_decode_attn_rope = {
+        1, 0, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0,
+        freq_base, freq_scale, ext_factor, attn_factor,
+        beta_fast, beta_slow
+    };
+}
+
+extern "C" int ds4_gpu_decode_attn_rope_fuse_used(void) {
+    return g_rocm_decode_attn_rope.used;
+}
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
@@ -4884,9 +4927,12 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             !cuda_env_present(getenv("DS4_ROCM_DISABLE_ROUTER_WAVE64"));
         g_rocm_cfg.attention_cooperative_dot =
             !cuda_env_present(getenv("DS4_ROCM_DISABLE_ATTENTION_COOP_DOT"));
+        g_rocm_cfg.attention_indexed_transpose = !cuda_env_present(
+            getenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_TRANSPOSE"));
 #else
         g_rocm_cfg.router_wave64 = 0;
         g_rocm_cfg.attention_cooperative_dot = 0;
+        g_rocm_cfg.attention_indexed_transpose = 0;
 #endif
         uint32_t q8_decode_default = g_quality_mode ? 8u : 1u;
 #if defined(DS4_GFX906)

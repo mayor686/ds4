@@ -1,10 +1,21 @@
 #include "ds4_gpu.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+
+#if defined(DS4_ROCM_BUILD)
+extern int ds4_gpu_decode_attn_rope_fuse_available(void);
+extern void ds4_gpu_set_decode_attn_rope_fuse(
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t n_ctx_orig, bool inverse, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow);
+#endif
 
 static double monotonic_seconds(void) {
     struct timespec ts;
@@ -303,6 +314,236 @@ static int check_decode_attention_ring_reference(void) {
     return rc;
 }
 
+static int check_decode_attention_indexed_reference(void) {
+    enum {
+        n_head = 64,
+        head_dim = 512,
+        n_raw = 256,
+        raw_cap = 300,
+        raw_start = 271,
+        n_comp = 4096,
+        top_k = 512,
+        pos0 = 16383,
+        ratio = 4,
+    };
+    const uint64_t q_count = (uint64_t)n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    float *sinks = (float *)malloc(n_head * sizeof(float));
+    float *q_host = (float *)malloc((size_t)q_count * sizeof(float));
+    float *raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
+    float *comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
+    int32_t *topk_host = (int32_t *)malloc(top_k * sizeof(int32_t));
+    float *heads_host = (float *)malloc((size_t)q_count * sizeof(float));
+    const int compare_paths = getenv("DS4_TEST_ATTENTION_AB") != NULL;
+    float *stable_heads = compare_paths
+        ? (float *)malloc((size_t)q_count * sizeof(float)) : NULL;
+    float *reference = (float *)malloc((size_t)q_count * sizeof(float));
+    float *scores = (float *)malloc((n_raw + top_k) * sizeof(float));
+    if (!sinks || !q_host || !raw_host || !comp_host || !topk_host ||
+        !heads_host || (compare_paths && !stable_heads) ||
+        !reference || !scores) return 1;
+
+    for (uint32_t h = 0; h < n_head; h++)
+        sinks[h] = -0.35f + (float)(h % 11u) * 0.017f;
+    for (uint64_t i = 0; i < q_count; i++)
+        q_host[i] = (float)((int)((i * 13u + 7u) % 127u) - 63) / 600.0f;
+    for (uint64_t i = 0; i < raw_count; i++)
+        raw_host[i] = (float)((int)((i * 17u + 5u) % 131u) - 65) / 500.0f;
+    for (uint64_t i = 0; i < comp_count; i++)
+        comp_host[i] = (float)((int)((i * 19u + 3u) % 137u) - 68) / 550.0f;
+    for (uint32_t i = 0; i < top_k; i++)
+        topk_host[i] = (int32_t)((i * 7u + 11u) % n_comp);
+
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q_host + (uint64_t)h * head_dim;
+        float max_score = sinks[h];
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = (raw_start + r) % raw_cap;
+            const float *kv = raw_host + (uint64_t)row * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+            scores[r] = dot * scale;
+            if (scores[r] > max_score) max_score = scores[r];
+        }
+        for (uint32_t i = 0; i < top_k; i++) {
+            const float *kv = comp_host + (uint64_t)topk_host[i] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+            scores[n_raw + i] = dot * scale;
+            if (scores[n_raw + i] > max_score) max_score = scores[n_raw + i];
+        }
+        float denom = expf(sinks[h] - max_score);
+        for (uint32_t r = 0; r < n_raw + top_k; r++) {
+            scores[r] = expf(scores[r] - max_score);
+            denom += scores[r];
+        }
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t row = (raw_start + r) % raw_cap;
+                acc += scores[r] * raw_host[(uint64_t)row * head_dim + d];
+            }
+            for (uint32_t i = 0; i < top_k; i++) {
+                acc += scores[n_raw + i] *
+                    comp_host[(uint64_t)topk_host[i] * head_dim + d];
+            }
+            reference[(uint64_t)h * head_dim + d] = acc / denom;
+        }
+    }
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *topk_t = ds4_gpu_tensor_alloc(top_k * sizeof(int32_t));
+    int rc = 1;
+    if (heads && q && raw && comp && topk_t &&
+        ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(topk_t, 0, topk_host,
+                             top_k * sizeof(int32_t))) {
+        const int warm = 5;
+        const int iters = 50;
+        int ok = 1;
+        if (stable_heads) {
+            setenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_TRANSPOSE", "1", 1);
+            for (int i = 0; ok && i < warm; i++) {
+                ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                    heads, sinks, n_head * sizeof(float), 0, q, raw, comp, 0,
+                    topk_t, 1, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                    0, ratio, n_head, head_dim);
+            }
+            ok = ok && ds4_gpu_synchronize() && ds4_gpu_tensor_read(
+                heads, 0, stable_heads, q_count * sizeof(float));
+            if (ok) unsetenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_TRANSPOSE");
+        }
+        for (int i = 0; ok && i < warm; i++) {
+            ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                heads, sinks, n_head * sizeof(float), 0, q, raw, comp, 0,
+                topk_t, 1, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                0, ratio, n_head, head_dim);
+        }
+        ok = ok && ds4_gpu_synchronize();
+        const double t0 = monotonic_seconds();
+        for (int i = 0; ok && i < iters; i++) {
+            ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                heads, sinks, n_head * sizeof(float), 0, q, raw, comp, 0,
+                topk_t, 1, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                0, ratio, n_head, head_dim);
+        }
+        ok = ok && ds4_gpu_synchronize();
+        const double elapsed_ms =
+            (monotonic_seconds() - t0) * 1000.0 / (double)iters;
+        int rope_regression_failed = 0;
+        if (ok && ds4_gpu_tensor_read(
+                heads, 0, heads_host, q_count * sizeof(float))) {
+            float max_abs = 0.0f;
+            float max_rel = 0.0f;
+            uint64_t output_hash = UINT64_C(1469598103934665603);
+            for (uint64_t i = 0; i < q_count; i++) {
+                const float abs_err = fabsf(heads_host[i] - reference[i]);
+                const float rel_err =
+                    abs_err / fmaxf(1.0e-4f, fabsf(reference[i]));
+                if (abs_err > max_abs) max_abs = abs_err;
+                if (rel_err > max_rel) max_rel = rel_err;
+                uint32_t bits;
+                memcpy(&bits, &heads_host[i], sizeof(bits));
+                for (uint32_t byte = 0; byte < sizeof(bits); byte++) {
+                    output_hash ^= (bits >> (8u * byte)) & 0xffu;
+                    output_hash *= UINT64_C(1099511628211);
+                }
+            }
+            fprintf(stderr,
+                    "gpu-regression: indexed attention 16K avg=%.3f ms "
+                    "max_abs=%g max_rel=%g hash=%016" PRIx64 "\n",
+                    elapsed_ms, (double)max_abs, (double)max_rel, output_hash);
+            if (stable_heads) {
+                float path_max_abs = 0.0f;
+                double path_sum_sq = 0.0;
+                uint64_t path_exact = 0;
+                for (uint64_t i = 0; i < q_count; i++) {
+                    const float d = fabsf(heads_host[i] - stable_heads[i]);
+                    if (d > path_max_abs) path_max_abs = d;
+                    path_sum_sq += (double)d * (double)d;
+                    if (d == 0.0f) path_exact++;
+                }
+                fprintf(stderr,
+                        "gpu-regression: indexed attention stable/transpose "
+                        "max_abs=%g rms=%g exact=%" PRIu64 "/%" PRIu64 "\n",
+                        (double)path_max_abs,
+                        sqrt(path_sum_sq / (double)q_count),
+                        path_exact, q_count);
+            }
+#if defined(DS4_ROCM_BUILD)
+            if (stable_heads && ds4_gpu_decode_attn_rope_fuse_available()) {
+                float *rope_reference = (float *)malloc(
+                    (size_t)q_count * sizeof(float));
+                int rope_ok = rope_reference != NULL &&
+                    ds4_gpu_rope_tail_tensor(
+                        heads, 1, n_head, head_dim, 64, pos0, 65536, true,
+                        160000.0f, 1.0f / 16.0f, 1.0f,
+                        1.0f / (1.0f + 0.1f * logf(16.0f)),
+                        32.0f, 1.0f) &&
+                    ds4_gpu_synchronize() &&
+                    ds4_gpu_tensor_read(heads, 0, rope_reference,
+                                         q_count * sizeof(float));
+                if (rope_ok) {
+                    ds4_gpu_set_decode_attn_rope_fuse(
+                        head_dim, 64, pos0, 65536, true,
+                        160000.0f, 1.0f / 16.0f, 1.0f,
+                        1.0f / (1.0f + 0.1f * logf(16.0f)),
+                        32.0f, 1.0f);
+                    rope_ok =
+                        ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                            heads, sinks, n_head * sizeof(float), 0,
+                            q, raw, comp, 0, topk_t, 1, pos0,
+                            n_raw, raw_cap, raw_start, n_comp, top_k,
+                            0, ratio, n_head, head_dim) &&
+                        ds4_gpu_synchronize() &&
+                        ds4_gpu_tensor_read(heads, 0, heads_host,
+                                             q_count * sizeof(float));
+                }
+                float rope_max_abs = 0.0f;
+                double rope_sum_sq = 0.0;
+                uint64_t rope_exact = 0;
+                if (rope_ok) {
+                    for (uint64_t i = 0; i < q_count; i++) {
+                        const float d = fabsf(
+                            heads_host[i] - rope_reference[i]);
+                        if (d > rope_max_abs) rope_max_abs = d;
+                        rope_sum_sq += (double)d * (double)d;
+                        if (d == 0.0f) rope_exact++;
+                    }
+                    fprintf(stderr,
+                            "gpu-regression: indexed attention fused-RoPE "
+                            "max_abs=%g rms=%g exact=%" PRIu64 "/%" PRIu64 "\n",
+                            (double)rope_max_abs,
+                            sqrt(rope_sum_sq / (double)q_count),
+                            rope_exact, q_count);
+                }
+                if (!rope_ok || rope_max_abs > 1.0e-7f)
+                    rope_regression_failed = 1;
+                free(rope_reference);
+            }
+#endif
+            rc = (max_abs <= 2.0e-5f && max_rel <= 2.0e-3f &&
+                  !rope_regression_failed) ? 0 : 1;
+        }
+    }
+    ds4_gpu_tensor_free(topk_t);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads);
+    free(scores); free(reference); free(stable_heads); free(heads_host);
+    free(topk_host);
+    free(comp_host); free(raw_host); free(q_host); free(sinks);
+    return rc;
+}
+
 static float ordered_add(float a, float b) {
     volatile float lhs = a;
     volatile float rhs = b;
@@ -397,6 +638,7 @@ int main(void) {
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_decode_attention_ring_reference() != 0) rc = 1;
+    if (check_decode_attention_indexed_reference() != 0) rc = 1;
     if (check_owned_moe_combine() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("GPU long-context regression: OK");

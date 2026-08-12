@@ -811,6 +811,18 @@ static int routed_moe_launch(
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && n_tokens >= 128u;
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u;
+#if defined(DS4_GFX906)
+        /* A one-token Flash routed-MoE launches only 96 workgroups when each
+         * eight-lane group processes four rows.  That exposes too little
+         * parallelism for Vega 20's 60 CUs.  One row per group raises the
+         * grid to 384 workgroups without changing any row's arithmetic. */
+        const uint32_t use_decode_lut_rpg1 =
+            use_decode_lut_gate &&
+            !cuda_env_present(
+                getenv("DS4_ROCM_DISABLE_MOE_IQ2_RPG1"));
+#else
+        const uint32_t use_decode_lut_rpg1 = 0u;
+#endif
         const uint32_t gate_row_span = 1024u;
         const uint32_t down_row_span = 1024u;
         const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && use_down_tile16;
@@ -1313,7 +1325,9 @@ static int routed_moe_launch(
                         clamp);
                 }
             } else if (ok) {
-                dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
+                const uint32_t gate_rows = use_decode_lut_rpg1 ? 32u : 128u;
+                dim3 qgrid((expert_mid_dim + gate_rows - 1u) / gate_rows,
+                           pair_count, 1);
                 if (q4k_path) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
@@ -1332,23 +1346,45 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w,
-                        xq,
-                        (const int32_t *)selected_exec->ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        write_gate_up,
-                        0xffffffffu,
-                        clamp);
+                    if (use_decode_lut_rpg1) {
+                        moe_gate_up_mid_decode_lut_qwarp32_kernel<1u>
+                                <<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            0xffffffffu,
+                            clamp);
+                    } else {
+                        moe_gate_up_mid_decode_lut_qwarp32_kernel<4u>
+                                <<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            0xffffffffu,
+                            clamp);
+                    }
                 } else {
                     moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,

@@ -959,3 +959,69 @@ make tests/rocm_tp_ipc_star tests/rocm_tp_q8_ipc_e2e \
 ./tests/rocm_tp_q8_ipc_e2e --devices 0,1
 ./tests/rocm_ep_iq2_q2_ipc_e2e --devices 0,1
 ```
+
+## Aggiornamento 12 agosto 2026: kernel decode gfx906
+
+Il profilo `rocprof` sul Routed-MoE Flash-0731 ha mostrato che gate/up occupava
+il 72,3% della fase MoE. Il kernel storico assegnava quattro righe a ogni
+sottogruppo da otto lane e lanciava solo 96 workgroup, cioè 1,6 workgroup per
+CU sulle 60 CU di Vega 20. Il percorso gfx906 assegna ora una riga per
+sottogruppo: 384 workgroup e lo stesso identico ordine aritmetico per riga.
+
+| Routed-MoE Flash-0731 | Prima | Dopo | Variazione |
+|---|---:|---:|---:|
+| Singola gfx906 | 0,320 ms | 0,265 ms | **-17,2% latenza / 1,21x** |
+| Decode PP6 a 1K, media A/B | 13,62 tok/s | 13,96 tok/s | **+2,5%** |
+| Decode PP6 finale a 1K | — | 14,00 tok/s | — |
+
+La geometria intermedia da due righe misura 0,281 ms e viene scartata. Anche
+la riduzione del down-projection da 256 a 128 thread è neutra entro il rumore.
+`DS4_ROCM_DISABLE_MOE_IQ2_RPG1=1` ripristina il kernel storico per diagnosi.
+
+### Attention indexed a contesto lungo
+
+Il Q·K indexed leggeva 768 righe da 512 float con accessi distanti tra le lane.
+Il nuovo percorso raccoglie una volta le 256 righe raw e le 512 righe top-k in
+un buffer temporaneo trasposto di circa 1,5 MiB. Q·K legge così dati coalescenti;
+la somma pesata V continua invece a leggere la cache originale, che è il layout
+coalescente per quella fase. Le quattro catene FP32 `s0..s3` e il loro ordine
+di riduzione restano quelli del kernel precedente.
+
+| Attention 16K, 64 head × 512 | Prima | Dopo | Variazione |
+|---|---:|---:|---:|
+| Microbenchmark deterministico | 1,347 ms | 0,382 ms | **-71,6% / 3,53x** |
+| Decode PP6 A/B | 10,14 tok/s | 12,27 tok/s | **+21,0%** |
+| Prefill PP6 A/B | 204,14 tok/s | 203,84 tok/s | -0,15% (rumore) |
+
+Il confronto nello stesso processo contro il percorso storico dà massimo
+assoluto `9,31e-10`, RMS `5,78e-11` e 29.080 valori bit-identici su 32.768.
+Una prima variante con riduzione cooperativa wave32 era altrettanto veloce, ma
+ha prodotto RMS `0,312` e massimo `2,049` sui logits completi: è stata rimossa.
+Il rollback diagnostico del percorso accettato è
+`DS4_ROCM_DISABLE_ATTENTION_INDEXED_TRANSPOSE=1`.
+
+L'inverse-RoPE indexed è inoltre eseguito nello stesso kernel dopo la somma V.
+Il test confronta tutti i 32.768 float con il precedente kernel RoPE separato:
+massimo e RMS sono zero, quindi il risultato è bit-identico. L'A/B completo
+misura 12,23→12,27 tok/s (+0,33%); il guadagno è piccolo ma coerente nei sei
+tempi per-stadio e non modifica il prefill. Il rollback è
+`DS4_ROCM_DISABLE_ATTN_INV_ROPE_FUSE=1`.
+
+Risultati riproducibili:
+
+- attention precedente: `.ds4-benchmarks/gfx906-0731/20260812-125829-long16k`;
+- transpose A/B: `.ds4-benchmarks/gfx906-0731/20260812-130030-long16k`;
+- percorso finale: `.ds4-benchmarks/gfx906-0731/20260812-132455-long16k`;
+- inverse-RoPE on/off: `.ds4-benchmarks/gfx906-0731/20260812-133854-long16k`
+  e `.ds4-benchmarks/gfx906-0731/20260812-134045-long16k`;
+- profilo per fase: `.ds4-benchmarks/gfx906-0731/20260812-132716-graph`.
+
+### Ipotesi distribuite escluse
+
+Il prefill usa già sender, reader e forwarder separati e sovrappone invio TCP e
+calcolo GPU. Nel decode 16K ogni worker spende circa 0,12-0,14 ms per invio e il
+totale dei cinque hop resta sotto l'1% dei 78-82 ms/token. Il `downstream_wait`
+è quasi interamente il calcolo degli stadi successivi, non tempo CPU recuperabile.
+La generazione è autoregressiva e non può mettere in pipeline due token target.
+Ulteriore threading CPU o una pipeline più profonda non offre quindi un margine
+significativo su questa topologia; il prossimo lavoro utile resta nei kernel GPU.

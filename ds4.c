@@ -21924,10 +21924,15 @@ static bool metal_graph_encode_decode_layer_phase(
      * kernel, which already owns each head's whole row. Removes one
      * 64-threadgroup dispatch per layer. */
     const bool fuse_attn_inv_rope =
+#if defined(DS4_ROCM_BUILD)
+        getenv("DS4_ROCM_DISABLE_ATTN_INV_ROPE_FUSE") == NULL &&
+        ds4_gpu_decode_attn_rope_fuse_available() != 0;
+#else
         getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE") == NULL &&
         (ds4_gpu_device_is_pre_m5_apple_silicon() ||
          ds4_gpu_device_is_m5_apple_silicon()) &&
         ds4_gpu_decode_attn_rope_fuse_available() != 0;
+#endif
     /* The backend's consumed flag is process-global and remains true after a
      * gathered-attention layer. Track whether this layer actually armed the
      * fusion so a following indexed-attention layer cannot mistake that stale
@@ -23309,6 +23314,16 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                 &decode_index_stage_t0);
             }
         } else if (ok && indexed_attention) {
+#if defined(DS4_ROCM_BUILD)
+            if (fuse_attn_inv_rope) {
+                ds4_gpu_set_decode_attn_rope_fuse(
+                    DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    true, freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+                attn_inv_rope_fuse_armed = true;
+            }
+#endif
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     metal_graph_heads(g),
                     model->map,

@@ -845,11 +845,15 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        uint32_t use_vec4) {
+        uint32_t use_vec4,
+        const float *kv_transposed,
+        uint32_t transposed_rows,
+        ds4_rocm_decode_attn_rope_config rope) {
     const uint32_t h = (uint32_t)blockIdx.x;
     if (h >= n_head) return;
     extern __shared__ float scores[];
     __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
+    __shared__ uint32_t comp_slots[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ uint32_t comp_count_s;
     const uint32_t tid = threadIdx.x;
     const float *qh = q + (uint64_t)h * head_dim;
@@ -868,7 +872,10 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
             const int32_t ci = topk[i];
             if (ci < 0) continue;
             const uint32_t c = (uint32_t)ci;
-            if (c < n_comp && c < visible_comp) comp_rows[comp_count_s++] = c;
+            if (c < n_comp && c < visible_comp) {
+                comp_slots[comp_count_s] = i;
+                comp_rows[comp_count_s++] = c;
+            }
         }
     }
     __syncthreads();
@@ -879,7 +886,23 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
         const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
         const float *kv = raw_kv + (uint64_t)row * head_dim;
-        float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+        float s = 0.0f;
+        if (kv_transposed) {
+            const float4 *q4 = (const float4 *)qh;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            for (uint32_t i = 0; i < (head_dim >> 2u); i++) {
+                const float4 av = q4[i];
+                const uint64_t d0 =
+                    (uint64_t)(4u * i) * transposed_rows + r;
+                s0 += av.x * kv_transposed[d0];
+                s1 += av.y * kv_transposed[d0 + transposed_rows];
+                s2 += av.z * kv_transposed[d0 + 2u * transposed_rows];
+                s3 += av.w * kv_transposed[d0 + 3u * transposed_rows];
+            }
+            s = (s0 + s1) + (s2 + s3);
+        } else if (use_vec4) {
+            s = attention_dot_f32_vec4_oldhip(qh, kv, head_dim);
+        }
         if (!use_vec4) {
             for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
         }
@@ -897,7 +920,21 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
             kv = comp_kv + (uint64_t)row * head_dim;
         }
         float dot = 0.0f;
-        if constexpr (COMP_F16) {
+        if (kv_transposed) {
+            const uint32_t rr = n_raw + comp_slots[c];
+            const float4 *q4 = (const float4 *)qh;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            for (uint32_t i = 0; i < (head_dim >> 2u); i++) {
+                const float4 av = q4[i];
+                const uint64_t d0 =
+                    (uint64_t)(4u * i) * transposed_rows + rr;
+                s0 += av.x * kv_transposed[d0];
+                s1 += av.y * kv_transposed[d0 + transposed_rows];
+                s2 += av.z * kv_transposed[d0 + 2u * transposed_rows];
+                s3 += av.w * kv_transposed[d0 + 3u * transposed_rows];
+            }
+            dot = (s0 + s1) + (s2 + s3);
+        } else if constexpr (COMP_F16) {
             dot = use_vec4
                 ? attention_dot_f16_vec4_oldhip(qh, kv, head_dim)
                 : 0.0f;
@@ -931,15 +968,104 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < n_raw; r++) {
-            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
-            acc += scores[r] * raw_kv[(uint64_t)row * head_dim + d];
+            const float value = raw_kv[(uint64_t)(raw_cap
+                ? ((raw_start + r) % raw_cap) : r) * head_dim + d];
+            acc += scores[r] * value;
         }
         for (uint32_t c = 0; c < comp_count; c++) {
-            const uint32_t row = comp_rows[c];
-            acc += scores[n_raw + c] * attention_comp_load<COMP_F16>(
-                comp_kv, (uint64_t)row * head_dim + d);
+            const float value = attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)comp_rows[c] * head_dim + d);
+            acc += scores[n_raw + c] * value;
         }
         heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
+    }
+    __syncthreads();
+    if (rope.armed && tid < rope.n_rot / 2u) {
+        const uint32_t pair = tid;
+        const uint32_t i = pair * 2u;
+        const uint32_t n_nope = rope.head_dim - rope.n_rot;
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (rope.ext_factor != 0.0f) {
+            const float denom = 2.0f * logf(rope.freq_base);
+            corr0 = floorf((float)rope.n_rot *
+                logf((float)rope.n_ctx_orig /
+                     (rope.beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)rope.n_rot *
+                logf((float)rope.n_ctx_orig /
+                     (rope.beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(rope.n_rot - 1u), corr1);
+        }
+        const float theta_scale =
+            powf(rope.freq_base, -2.0f / (float)rope.n_rot);
+        const float theta_extrap = (float)rope.pos0 *
+            powf(theta_scale, (float)pair);
+        const float theta_interp = rope.freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = rope.attn_factor;
+        if (rope.ext_factor != 0.0f) {
+            const float ramp_mix =
+                rope_yarn_ramp_dev(corr0, corr1, (int)i) * rope.ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) +
+                    theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / rope.freq_scale);
+        }
+        const float c = cosf(theta) * mscale;
+        float s = sinf(theta) * mscale;
+        if (rope.inverse) s = -s;
+        float *tail = heads + (uint64_t)h * head_dim + n_nope;
+        const float x0 = tail[i];
+        const float x1 = tail[i + 1u];
+        tail[i] = x0 * c - x1 * s;
+        tail[i + 1u] = x0 * s + x1 * c;
+    }
+}
+
+template <bool COMP_F16>
+__global__ static void attention_gather_transpose_indexed_kv_kernel(
+        float *out,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t head_dim,
+        uint32_t n_rows) {
+    __shared__ float tile[32][33];
+    const uint32_t d = blockIdx.x * 32u + threadIdx.x;
+    const uint32_t row0 = blockIdx.y * 32u;
+    for (uint32_t j = 0; j < 32u; j += blockDim.y) {
+        const uint32_t row = row0 + threadIdx.y + j;
+        float value = 0.0f;
+        if (row < n_rows && d < head_dim) {
+            if (row < n_raw) {
+                const uint32_t raw_row = raw_cap
+                    ? ((raw_start + row) % raw_cap) : row;
+                value = raw_kv[(uint64_t)raw_row * head_dim + d];
+            } else {
+                const uint32_t i = row - n_raw;
+                if (i < top_k) {
+                    const int32_t comp_row = topk[i];
+                    if (comp_row >= 0 && (uint32_t)comp_row < n_comp) {
+                        value = attention_comp_load<COMP_F16>(
+                            comp_kv, (uint64_t)(uint32_t)comp_row * head_dim + d);
+                    }
+                }
+            }
+        }
+        tile[threadIdx.y + j][threadIdx.x] = value;
+    }
+    __syncthreads();
+    for (uint32_t j = 0; j < 32u; j += blockDim.y) {
+        const uint32_t out_d = blockIdx.x * 32u + threadIdx.y + j;
+        const uint32_t out_row = row0 + threadIdx.x;
+        if (out_d < head_dim && out_row < n_rows) {
+            out[(uint64_t)out_d * n_rows + out_row] =
+                tile[threadIdx.x][threadIdx.y + j];
+        }
     }
 }
 

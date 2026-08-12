@@ -651,6 +651,51 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_tokens == 1u && cfg->oldhip_attention_decode) {
         const uint32_t rows = n_raw + (top_k < n_comp ? top_k : n_comp);
         const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);
+        float *kv_transposed = NULL;
+        const uint32_t visible_comp = ratio != 0u
+            ? ((pos0 + 1u) / ratio < n_comp
+                ? (pos0 + 1u) / ratio : n_comp)
+            : n_comp;
+        const bool transpose =
+            cfg->attention_indexed_transpose &&
+            !cuda_env_present(getenv(
+                "DS4_ROCM_DISABLE_ATTENTION_INDEXED_TRANSPOSE")) &&
+            visible_comp == n_comp && top_k <= n_comp && rows != 0u &&
+            (head_dim & 3u) == 0u &&
+            rows <= UINT64_MAX / head_dim;
+        if (transpose) {
+            const uint64_t count = (uint64_t)rows * head_dim;
+            kv_transposed = (float *)cuda_tmp_alloc(
+                count * sizeof(float), "indexed attention transposed KV");
+            if (!kv_transposed) return 0;
+            const dim3 gather_block(32u, 8u, 1u);
+            const dim3 gather_grid((head_dim + 31u) / 32u,
+                                   (rows + 31u) / 32u, 1u);
+            if (comp_kv_f16)
+                attention_gather_transpose_indexed_kv_kernel<true>
+                        <<<gather_grid, gather_block>>>(
+                    kv_transposed, (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr, topk_ptr, n_raw, raw_cap,
+                    raw_start, n_comp, top_k, head_dim, rows);
+            else
+                attention_gather_transpose_indexed_kv_kernel<false>
+                        <<<gather_grid, gather_block>>>(
+                    kv_transposed, (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr, topk_ptr, n_raw, raw_cap,
+                    raw_start, n_comp, top_k, head_dim, rows);
+            if (!cuda_ok(cudaGetLastError(),
+                         "attention indexed gather transpose launch")) return 0;
+        }
+        ds4_rocm_decode_attn_rope_config rope = {};
+        if (g_rocm_decode_attn_rope.armed &&
+            g_rocm_decode_attn_rope.head_dim == head_dim &&
+            g_rocm_decode_attn_rope.n_rot <= head_dim &&
+            (g_rocm_decode_attn_rope.n_rot & 1u) == 0u &&
+            g_rocm_decode_attn_rope.n_rot / 2u <= 256u) {
+            rope = g_rocm_decode_attn_rope;
+            g_rocm_decode_attn_rope.armed = 0;
+            g_rocm_decode_attn_rope.used = 1;
+        }
         if (comp_kv_f16)
             attention_decode_indexed_mixed_one_fast_oldhip_kernel<true><<<
                     (unsigned)n_head, 256, shmem>>>(
@@ -669,7 +714,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 ratio,
                 n_head,
                 head_dim,
-                (uint32_t)((head_dim & 3u) == 0u));
+                (uint32_t)((head_dim & 3u) == 0u),
+                kv_transposed,
+                rows,
+                rope);
         else
             attention_decode_indexed_mixed_one_fast_oldhip_kernel<false><<<
                     (unsigned)n_head, 256, shmem>>>(
@@ -688,7 +736,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 ratio,
                 n_head,
                 head_dim,
-                (uint32_t)((head_dim & 3u) == 0u));
+                (uint32_t)((head_dim & 3u) == 0u),
+                kv_transposed,
+                rows,
+                rope);
         return cuda_ok(cudaGetLastError(), "attention indexed decode oldhip fast launch");
     }
     if (n_tokens > 1u && top_k == 512u) {

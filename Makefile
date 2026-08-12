@@ -294,6 +294,9 @@ ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distrib
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
+tests/rocm_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
+	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ tests/cuda_long_context_smoke.c
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -449,7 +452,7 @@ test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 endif
 
-tests/rocm_long_context_smoke: tests/cuda_long_context_smoke.o ds4_rocm.o
+tests/rocm_long_context_smoke: tests/rocm_long_context_smoke.o ds4_rocm.o
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/rocm_tp_q8_projection.o: tests/rocm_tp_q8_projection.cu ds4_gpu.h
