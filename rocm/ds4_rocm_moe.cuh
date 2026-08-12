@@ -9,6 +9,221 @@
 #else
 #include <rocwmma/rocwmma.hpp>
 #endif
+
+__global__ static void moe_filter_owned_pairs_kernel(
+        int32_t *selected,
+        float *weights,
+        uint64_t pair_count,
+        uint32_t n_total_expert,
+        uint32_t expert_base,
+        uint32_t expert_count) {
+    const uint64_t pair = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= pair_count) return;
+    const int32_t expert_i = selected[pair];
+    if (expert_i >= 0 && (uint32_t)expert_i < n_total_expert &&
+        (uint32_t)expert_i >= expert_base &&
+        (uint32_t)expert_i - expert_base < expert_count) {
+        selected[pair] = expert_i - (int32_t)expert_base;
+    } else {
+        selected[pair] = -1;
+        weights[pair] = 0.0f;
+    }
+}
+
+__global__ static void moe_prepare_owned_pairs_kernel(
+        int32_t *local_selected,
+        float *local_weights,
+        const int32_t *selected,
+        const float *weights,
+        uint32_t pair_count,
+        uint32_t expert_base,
+        uint32_t expert_count) {
+    const uint32_t pair = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= pair_count) return;
+    const int32_t expert_i = selected[pair];
+    const bool owned = expert_i >= 0 &&
+        (uint32_t)expert_i >= expert_base &&
+        (uint32_t)expert_i - expert_base < expert_count;
+    local_selected[pair] = owned
+        ? expert_i - (int32_t)expert_base : -1;
+    local_weights[pair] = owned ? weights[pair] : 0.0f;
+}
+
+__device__ __forceinline__ static bool moe_owned_local_expert(
+        int32_t expert, uint32_t expert_base, uint32_t expert_count,
+        uint32_t *local_expert) {
+    if (expert < 0) return false;
+    const uint32_t e = (uint32_t)expert;
+    if (e < expert_base || e - expert_base >= expert_count) return false;
+    if (local_expert) *local_expert = e - expert_base;
+    return true;
+}
+
+__device__ __forceinline__ static int moe_owned_packed_component(
+        const int32_t *selected, uint32_t group, uint32_t component,
+        uint32_t expert_base, uint32_t expert_count, bool *prefix_pair) {
+    const uint32_t slot0 = group * 3u;
+    uint32_t mask = 0u;
+    #pragma unroll
+    for (uint32_t i = 0; i < 3u; i++) {
+        if (moe_owned_local_expert(selected[slot0 + i], expert_base,
+                                   expert_count, NULL)) mask |= 1u << i;
+    }
+    *prefix_pair = false;
+    if ((mask & 3u) == 3u) {
+        if (component == 0u) {
+            *prefix_pair = true;
+            return (int)slot0;
+        }
+        return (mask & 4u) ? (int)(slot0 + 2u) : -1;
+    }
+    uint32_t ordinal = 0u;
+    #pragma unroll
+    for (uint32_t i = 0; i < 3u; i++) {
+        if ((mask & (1u << i)) == 0u) continue;
+        if (ordinal++ == component) return (int)(slot0 + i);
+    }
+    return -1;
+}
+
+__global__ static void moe_down_owned_pack_f32_slots_kernel(
+        float *packed_out, const float *slots, const int32_t *selected,
+        uint32_t out_dim, uint32_t expert_base, uint32_t expert_count) {
+    const uint32_t col =
+        (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (col >= out_dim) return;
+    float slotv[6];
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++)
+        slotv[slot] = slots[(uint64_t)slot * out_dim + col];
+    float packed[4];
+    #pragma unroll
+    for (uint32_t p = 0; p < 4u; p++) {
+        bool prefix_pair = false;
+        const int first = moe_owned_packed_component(
+            selected, p / 2u, p & 1u, expert_base, expert_count,
+            &prefix_pair);
+        if (first < 0) packed[p] = 0.0f;
+        else if (prefix_pair) {
+            float value = __fadd_rn(0.0f, slotv[first]);
+            packed[p] = __fadd_rn(value, slotv[first + 1]);
+        }
+        else packed[p] = slotv[first];
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < 4u; p++)
+        packed_out[(uint64_t)p * out_dim + col] = packed[p];
+}
+
+__global__ static void moe_down_owned_copy_f32_slots_kernel(
+        float *dst, const float *src, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) dst[i] = src[i];
+}
+
+__global__ static void moe_owned_slots_combine_fixed3_kernel(
+        float *out,
+        const float *home_slots,
+        const float *peer_slots,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t expert_split) {
+    const uint32_t col =
+        (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim) return;
+    out += (uint64_t)row * out_dim;
+    home_slots += (uint64_t)row * 6u * out_dim;
+    peer_slots += (uint64_t)row * 6u * out_dim;
+    selected += (uint64_t)row * 6u;
+    float slotv[6];
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        const int32_t expert = selected[slot];
+        if (expert < 0 || (uint32_t)expert >= 2u * expert_split) {
+            slotv[slot] = 0.0f;
+        } else {
+            const float *src = (uint32_t)expert < expert_split
+                ? home_slots : peer_slots;
+            slotv[slot] = src[(uint64_t)slot * out_dim + col];
+        }
+    }
+    float lo = __fadd_rn(0.0f, slotv[0]);
+    lo = __fadd_rn(lo, slotv[1]);
+    lo = __fadd_rn(lo, slotv[2]);
+    float hi = __fadd_rn(0.0f, slotv[3]);
+    hi = __fadd_rn(hi, slotv[4]);
+    hi = __fadd_rn(hi, slotv[5]);
+    out[col] = __fadd_rn(lo, hi);
+}
+
+__device__ __forceinline__ static float moe_owned_packed_combine_row(
+        const float *home_slots,
+        const float *peer_packed,
+        const int32_t *selected,
+        uint32_t row,
+        uint32_t out_dim,
+        uint32_t expert_split) {
+    float groups[2];
+    #pragma unroll
+    for (uint32_t group = 0; group < 2u; group++) {
+        const uint32_t slot0 = group * 3u;
+        uint32_t peer_mask = 0u;
+        uint32_t valid_mask = 0u;
+        #pragma unroll
+        for (uint32_t i = 0; i < 3u; i++) {
+            const int32_t expert = selected[slot0 + i];
+            if (expert >= 0 && (uint32_t)expert < 2u * expert_split)
+                valid_mask |= 1u << i;
+            if (expert >= 0 && (uint32_t)expert >= expert_split &&
+                (uint32_t)expert < 2u * expert_split)
+                peer_mask |= 1u << i;
+        }
+        const float *packed = peer_packed +
+            (uint64_t)group * 2u * out_dim + row;
+        float acc;
+        if ((peer_mask & 3u) == 3u) {
+            acc = packed[0];
+            float slot2 = 0.0f;
+            if ((peer_mask & 4u) != 0u)
+                slot2 = packed[out_dim];
+            else if ((valid_mask & 4u) != 0u)
+                slot2 = home_slots[(uint64_t)(slot0 + 2u) * out_dim + row];
+            acc = __fadd_rn(acc, slot2);
+        } else {
+            acc = 0.0f;
+            uint32_t peer_operand = 0u;
+            #pragma unroll
+            for (uint32_t i = 0; i < 3u; i++) {
+                float value = 0.0f;
+                if ((peer_mask & (1u << i)) != 0u) {
+                    value = packed[(uint64_t)peer_operand * out_dim];
+                    peer_operand++;
+                } else if ((valid_mask & (1u << i)) != 0u) {
+                    value = home_slots[(uint64_t)(slot0 + i) * out_dim + row];
+                }
+                acc = __fadd_rn(acc, value);
+            }
+        }
+        groups[group] = acc;
+    }
+    return __fadd_rn(groups[0], groups[1]);
+}
+
+__global__ static void moe_owned_packed_combine_fixed3_kernel(
+        float *out,
+        const float *home_slots,
+        const float *peer_packed,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t expert_split) {
+    const uint32_t row =
+        (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (row < out_dim) {
+        out[row] = moe_owned_packed_combine_row(
+            home_slots, peer_packed, selected, row, out_dim, expert_split);
+    }
+}
 #endif
 
 __device__ static float dev_f16_to_f32(uint16_t v) {

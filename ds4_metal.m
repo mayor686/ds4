@@ -4242,6 +4242,22 @@ uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)[g_device recommendedMaxWorkingSetSize];
 }
 
+int ds4_gpu_device_info(int logical_tier, char *name, size_t name_cap,
+                        uint64_t *memory_bytes) {
+    if (name_cap) name[0] = '\0';
+    if (memory_bytes) *memory_bytes = 0;
+    if (logical_tier != 0 || (!g_initialized && !ds4_gpu_init()) || !g_device) {
+        return 0;
+    }
+    const char *device_name = [[g_device name] UTF8String];
+    if (name_cap) snprintf(name, name_cap, "%s",
+                           device_name ? device_name : "Apple GPU");
+    if (memory_bytes) {
+        *memory_bytes = (uint64_t)[g_device recommendedMaxWorkingSetSize];
+    }
+    return 1;
+}
+
 static int ds4_gpu_model_map_log_enabled(void) {
     if (!g_ssd_streaming_mode) return 1;
     const char *trace = getenv("DS4_METAL_STREAMING_MAP_TRACE");

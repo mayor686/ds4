@@ -329,14 +329,24 @@ the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 
 The six-gfx906 PP6 example includes two self-contained profiles. Edit
 `MODEL_PATH` inside the selected file and run it directly; no launch-time
-environment variables are required. The speed profile uses a balanced 8 + 7x5
-layer split at 32K context, while the capacity profile keeps the conservative
-13 + 6x5 split needed by its larger KV cache:
+environment variables are required. The speed profile uses a measured
+6 + 7x4 + 9/output layer split at 700K context, while the capacity profile keeps the
+conservative 13 + 6x5 split needed by its larger KV cache:
 
 ```sh
-./run-speed.sh    # resident weights, 32K context, maximum throughput
-./run-context.sh  # 2GB expert cache per GPU, native 1M context
+./run-speed.sh    # resident weights, FP32 KV, 700K context
+./run-context.sh  # 156-expert cache per GPU, FP32 KV, native 1M context
 ```
+
+Both examples explicitly keep `DS4_ROCM_ATTN_COMP_CACHE_F16=0`. The compact
+cache remains an experimental diagnostic because its greedy output can diverge
+from FP32; production launchers do not trade model quality for capacity.
+
+The gfx906 build automatically keeps Routed-MoE prefill on the expert-tiled
+kernel. Vega 20 has no MFMA instructions, so running the hot-expert rocWMMA
+compatibility shim is slower even though the shim remains useful for numerical
+regression tests. `DS4_ROCM_ENABLE_EMULATED_MOE_WMMA=1` restores that legacy
+path for diagnostics; native rocWMMA architectures are unaffected.
 
 `run.sh` itself is not tied to that machine: `COORD_DEVICE`, `COORD_LAYERS`,
 and the space-separated `WORKER_SPECS` (`DEVICE,START:END`, with
@@ -1058,6 +1068,45 @@ Supported endpoints:
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
+
+### Monitoring dashboard
+
+`ds4-server` can expose a separate, read-only monitoring listener. It binds to
+loopback by default and is disabled unless a port is selected:
+
+```sh
+./ds4-server -m ds4flash.gguf --monitor-port 9091
+```
+
+Open `http://127.0.0.1:9091/` for the live dashboard. The listener also serves:
+
+- `GET /api/metrics` — structured JSON used by the dashboard.
+- `GET /metrics` — Prometheus text exposition.
+- `GET /health` — lightweight liveness check.
+
+The monitor stores only token counts, timings, cache decisions, and bounded
+recent-request summaries; it never stores prompt or generated text. Phase
+percentages are exclusive end-to-end server times. In the distributed stage
+table, `downstream_wait` includes later worker execution, so it overlaps those
+stages and is deliberately excluded from compute-share percentages. The
+inference-graph timeline shows the latest stage samples across the local
+coordinator and every remote layer stage. Each row reports the GPU name and
+VRAM learned from the backend at runtime; the slowest latest sample is marked
+as the current pipeline bottleneck and labelled as prefill or generation. The
+dashboard also reports context occupancy and remaining tokens, request and
+token-level KV reuse, success ratio, worker-path latency, pipeline balance,
+per-stage throughput/traffic, and a two-minute browser-local throughput
+history.
+
+On Linux systems using the `amdgpu` driver, the monitor reads the driver's
+read-only sysfs counters and shows every visible GPU's PCI address, live VRAM
+use, engine busy percentage, edge/junction/memory temperatures, fan speed, and
+board power when that sensor is exposed. These values are also exported in the
+Prometheus endpoint. No external monitoring command or web dependency is
+required; on unsupported systems the hardware table is simply empty.
+
+Use `--monitor-host` only when remote access is intentional; the monitoring
+listener has no authentication and should otherwise remain on `127.0.0.1`.
 
 The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does

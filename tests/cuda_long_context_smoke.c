@@ -259,6 +259,40 @@ static int check_decode_attention_ring_reference(void) {
         rc = (max_abs <= 2.0e-5f && max_rel <= 2.0e-3f) ? 0 : 1;
     }
 
+    if (rc == 0 && getenv("DS4_TEST_ROCM_F16_CACHE") != NULL) {
+        const uint32_t n_rot = 64;
+        const uint64_t compact_row_bytes =
+            (uint64_t)(head_dim - n_rot) * sizeof(uint16_t) +
+            (uint64_t)n_rot * sizeof(float);
+        ds4_gpu_tensor *comp_f16 = ds4_gpu_tensor_alloc(
+            (uint64_t)n_comp * compact_row_bytes);
+        float *heads_f16 = (float *)malloc((size_t)q_count * sizeof(float));
+        if (!comp_f16 || !heads_f16 ||
+            !ds4_gpu_tensor_pack_comp_kv_f16_rope_f32(
+                comp_f16, 0, comp, 0, n_comp, head_dim, n_rot) ||
+            !ds4_gpu_attention_decode_heads_tensor(
+                heads, sinks, n_head * sizeof(float), 0,
+                q, raw, n_raw, raw_cap, raw_start,
+                comp_f16, 1, n_comp, mask, 1, n_head, head_dim) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(heads, 0, heads_f16,
+                                 q_count * sizeof(float))) {
+            rc = 1;
+        } else {
+            float max_abs = 0.0f;
+            for (uint64_t i = 0; i < q_count; i++) {
+                const float err = fabsf(heads_f16[i] - heads_host[i]);
+                if (err > max_abs) max_abs = err;
+            }
+            fprintf(stderr,
+                    "gpu-regression: ROCm F16+RoPE-F32 compressed-cache max_abs=%g\n",
+                    (double)max_abs);
+            if (max_abs > 2.0e-4f) rc = 1;
+        }
+        ds4_gpu_tensor_free(comp_f16);
+        free(heads_f16);
+    }
+
     ds4_gpu_tensor_free(mask);
     ds4_gpu_tensor_free(comp);
     ds4_gpu_tensor_free(raw);
@@ -269,11 +303,101 @@ static int check_decode_attention_ring_reference(void) {
     return rc;
 }
 
+static float ordered_add(float a, float b) {
+    volatile float lhs = a;
+    volatile float rhs = b;
+    return lhs + rhs;
+}
+
+static int check_owned_moe_combine(void) {
+    enum { rows = 66, out_dim = 17, slots = 6 };
+    const uint32_t split = 128u;
+    int32_t selected[rows * slots];
+    float home[rows * slots * out_dim];
+    float peer[rows * slots * out_dim];
+    float expected[rows * out_dim];
+    float got[rows * out_dim];
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t s = 0; s < slots; s++) {
+            if (r < 64u) {
+                selected[r * slots + s] = (r & (1u << s))
+                    ? (int32_t)(split + s) : (int32_t)s;
+            } else if (r == 64u) {
+                selected[r * slots + s] = -1;
+            } else {
+                selected[r * slots + s] = s == 3u
+                    ? (int32_t)(2u * split) : (int32_t)s;
+            }
+            for (uint32_t c = 0; c < out_dim; c++) {
+                const float sign = (s & 1u) ? -1.0f : 1.0f;
+                home[((r * slots + s) * out_dim) + c] = sign *
+                    (10.0f * (float)(s + 1u) + 0.125f * (float)c);
+                peer[((r * slots + s) * out_dim) + c] = sign *
+                    (100.0f + 10.0f * (float)(s + 1u) +
+                     0.25f * (float)c);
+            }
+        }
+        for (uint32_t c = 0; c < out_dim; c++) {
+            float part0 = 0.0f;
+            float part1 = 0.0f;
+            for (uint32_t s = 0; s < 3u; s++) {
+                const int32_t e = selected[r * slots + s];
+                if (e >= 0 && (uint32_t)e < 2u * split) {
+                    const float *src = (uint32_t)e < split ? home : peer;
+                    part0 = ordered_add(
+                        part0, src[((r * slots + s) * out_dim) + c]);
+                }
+            }
+            for (uint32_t s = 3u; s < slots; s++) {
+                const int32_t e = selected[r * slots + s];
+                if (e >= 0 && (uint32_t)e < 2u * split) {
+                    const float *src = (uint32_t)e < split ? home : peer;
+                    part1 = ordered_add(
+                        part1, src[((r * slots + s) * out_dim) + c]);
+                }
+            }
+            expected[r * out_dim + c] = ordered_add(part0, part1);
+        }
+    }
+
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(sizeof(got));
+    ds4_gpu_tensor *home_t = ds4_gpu_tensor_alloc(sizeof(home));
+    ds4_gpu_tensor *peer_t = ds4_gpu_tensor_alloc(sizeof(peer));
+    ds4_gpu_tensor *selected_t = ds4_gpu_tensor_alloc(sizeof(selected));
+    int rc = 1;
+    if (out_t && home_t && peer_t && selected_t &&
+        ds4_gpu_tensor_write(home_t, 0, home, sizeof(home)) &&
+        ds4_gpu_tensor_write(peer_t, 0, peer, sizeof(peer)) &&
+        ds4_gpu_tensor_write(selected_t, 0, selected, sizeof(selected)) &&
+        ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
+            out_t, home_t, peer_t, selected_t, out_dim, split, rows) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(out_t, 0, got, sizeof(got))) {
+        rc = 0;
+        for (uint32_t i = 0; i < rows * out_dim; i++) {
+            if (got[i] != expected[i]) {
+                fprintf(stderr,
+                        "owned MoE combine mismatch i=%u got=%g expected=%g\n",
+                        i, (double)got[i], (double)expected[i]);
+                rc = 1;
+                break;
+            }
+        }
+    }
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(peer_t);
+    ds4_gpu_tensor_free(home_t);
+    ds4_gpu_tensor_free(out_t);
+    if (rc == 0) fprintf(stderr, "gpu-regression: owned MoE combine OK\n");
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_decode_attention_ring_reference() != 0) rc = 1;
+    if (check_owned_moe_combine() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("GPU long-context regression: OK");
     return rc;

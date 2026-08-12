@@ -92,6 +92,97 @@ extern "C" int ds4_gpu_tensor_copy_f32_to_f16(
     return cuda_ok(cudaGetLastError(), "tensor copy f32 to f16 launch");
 }
 
+__global__ static void tensor_pack_comp_kv_f16_rope_f32_kernel(
+        char *dst, const float *src, uint32_t n_rows,
+        uint32_t head_dim, uint32_t n_nope, uint32_t row_bytes) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)n_rows * head_dim;
+    if (i >= count) return;
+    const uint32_t row = (uint32_t)(i / head_dim);
+    const uint32_t dim = (uint32_t)(i - (uint64_t)row * head_dim);
+    char *row_dst = dst + (uint64_t)row * row_bytes;
+    if (dim < n_nope) {
+        ((__half *)row_dst)[dim] = __float2half_rn(src[i]);
+    } else {
+        float *rope = (float *)(row_dst + (uint64_t)n_nope * sizeof(__half));
+        rope[dim - n_nope] = src[i];
+    }
+}
+
+__global__ static void tensor_unpack_comp_kv_f16_rope_f32_kernel(
+        float *dst, const char *src, uint32_t n_rows,
+        uint32_t head_dim, uint32_t n_nope, uint32_t row_bytes) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)n_rows * head_dim;
+    if (i >= count) return;
+    const uint32_t row = (uint32_t)(i / head_dim);
+    const uint32_t dim = (uint32_t)(i - (uint64_t)row * head_dim);
+    const char *row_src = src + (uint64_t)row * row_bytes;
+    if (dim < n_nope) {
+        dst[i] = __half2float(((const __half *)row_src)[dim]);
+    } else {
+        const float *rope = (const float *)(
+            row_src + (uint64_t)n_nope * sizeof(__half));
+        dst[i] = rope[dim - n_nope];
+    }
+}
+
+static int tensor_comp_kv_layout_checked(
+        uint32_t head_dim, uint32_t n_rot, uint64_t *row_bytes) {
+    if (!row_bytes || head_dim == 0u || n_rot > head_dim) return 0;
+    const uint64_t n_nope = head_dim - n_rot;
+    *row_bytes = n_nope * sizeof(__half) + (uint64_t)n_rot * sizeof(float);
+    return *row_bytes <= UINT32_MAX;
+}
+
+extern "C" int ds4_gpu_tensor_pack_comp_kv_f16_rope_f32(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
+    uint64_t row_bytes = 0;
+    if (!dst || !src ||
+        !tensor_comp_kv_layout_checked(head_dim, n_rot, &row_bytes)) return 0;
+    const uint64_t src_bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    const uint64_t dst_bytes = (uint64_t)n_rows * row_bytes;
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) return 0;
+    if (n_rows == 0u) return 1;
+    const uint64_t count = (uint64_t)n_rows * head_dim;
+    tensor_pack_comp_kv_f16_rope_f32_kernel<<<
+        (count + 255u) / 256u, 256>>>(
+        (char *)dst->ptr + dst_offset,
+        (const float *)((const char *)src->ptr + src_offset),
+        n_rows, head_dim, head_dim - n_rot, (uint32_t)row_bytes);
+    return cuda_ok(cudaGetLastError(), "tensor pack compact KV launch");
+}
+
+extern "C" int ds4_gpu_tensor_unpack_comp_kv_f16_rope_f32(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
+    uint64_t row_bytes = 0;
+    if (!dst || !src ||
+        !tensor_comp_kv_layout_checked(head_dim, n_rot, &row_bytes)) return 0;
+    const uint64_t dst_bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    const uint64_t src_bytes = (uint64_t)n_rows * row_bytes;
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) return 0;
+    if (n_rows == 0u) return 1;
+    const uint64_t count = (uint64_t)n_rows * head_dim;
+    tensor_unpack_comp_kv_f16_rope_f32_kernel<<<
+        (count + 255u) / 256u, 256>>>(
+        (float *)((char *)dst->ptr + dst_offset),
+        (const char *)src->ptr + src_offset,
+        n_rows, head_dim, head_dim - n_rot, (uint32_t)row_bytes);
+    return cuda_ok(cudaGetLastError(), "tensor unpack compact KV launch");
+}
+
+/* ROCm can store the compressed cache in F16, but still uses the existing
+ * separate RoPE and FP8-rounding kernels. */
+extern "C" int ds4_gpu_kv_rope_fp8_fuse_available(void) {
+    return 0;
+}
+
 extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
     return 0;
 }

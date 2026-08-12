@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export MODEL_PATH="${SCRIPT_DIR}/ds4flash.gguf"
+export MODEL_PATH="/home/mayor86/llama/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 export CTX=1000000
 export MAX_TOKENS=1000000
 export PREFILL_CHUNK=64
@@ -13,12 +13,17 @@ export DIST_WINDOW=5
 export WORKER_START_DELAY=5
 export HTTP_HOST=0.0.0.0
 export HTTP_PORT=8080
+export MONITOR_HOST=127.0.0.1
+export MONITOR_PORT=9091
 export DIST_HOST=127.0.0.1
 export DIST_PORT=19000
 export DS4_PROFILE=0
 export DS4_COORD_SERIALIZE=0
+# Keep the same FP32 cache semantics as the resident profile. Exact expert-count
+# mode leaves enough VRAM for the native 1M KV cache on 16 GiB cards.
+export DS4_ROCM_ATTN_COMP_CACHE_F16=0
 export SSD_STREAMING=1
-export SSD_STREAMING_CACHE_EXPERTS=2GB
+export SSD_STREAMING_CACHE_EXPERTS=156
 export SSD_STREAMING_PRELOAD_EXPERTS=
 export SSD_STREAMING_COLD=0
 export COORD_DEVICE=2

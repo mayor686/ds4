@@ -266,7 +266,11 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    if (g_quality_mode || cuda_runtime_config()->graph_dump) return 0;
+    /* Multi-stream event synchronization is deliberately kept out of a
+     * captured decode island.  Returning unavailable selects the equivalent
+     * synchronous fused kernel on the captured stream. */
+    if (g_quality_mode || cuda_runtime_config()->graph_dump ||
+        g_rocm_decode_graph_capturing) return 0;
     if (g_shared_gate_up_pending && !cuda_shared_gate_up_async_wait_internal()) return 0;
     if (!gate || !up || !mid || !model_map || !x ||
         in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {

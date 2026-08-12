@@ -65,6 +65,7 @@ DIST_WINDOW="${DIST_WINDOW:-5}"           # larger windows can OOM 16 GB workers
 WORKER_START_DELAY="${WORKER_START_DELAY:-20}"
 DS4_PROFILE="${DS4_PROFILE:-0}"
 DS4_COORD_SERIALIZE="${DS4_COORD_SERIALIZE:-0}"
+DS4_ROCM_ATTN_COMP_CACHE_F16="${DS4_ROCM_ATTN_COMP_CACHE_F16:-0}"
 ROCPROF_COORD_OUTPUT_DIR="${ROCPROF_COORD_OUTPUT_DIR:-}"
 ROCPROF_WORKER_DEVICE="${ROCPROF_WORKER_DEVICE:-}"
 ROCPROF_WORKER_OUTPUT_DIR="${ROCPROF_WORKER_OUTPUT_DIR:-}"
@@ -96,9 +97,22 @@ if [ "${SSD_STREAMING}" != "0" ]; then
     fi
 fi
 
+if [ "${DS4_ROCM_ATTN_COMP_CACHE_F16}" != "0" ] &&
+   [ "${DS4_ROCM_ATTN_COMP_CACHE_F16}" != "1" ]; then
+    echo "run.sh: DS4_ROCM_ATTN_COMP_CACHE_F16 must be 0 (F32) or 1 (experimental compact cache)" >&2
+    exit 1
+fi
+
 # --- HTTP API ---
 HTTP_HOST="${HTTP_HOST:-0.0.0.0}"
 HTTP_PORT="${HTTP_PORT:-8080}"
+MONITOR_HOST="${MONITOR_HOST:-127.0.0.1}"
+MONITOR_PORT="${MONITOR_PORT:-0}"
+MONITOR_ARGS=()
+if [ "${MONITOR_PORT}" != "0" ]; then
+    MONITOR_ARGS+=(--monitor-host "${MONITOR_HOST}"
+                   --monitor-port "${MONITOR_PORT}")
+fi
 
 # --- MTP speculative decoding (draft model, P1 speedup) ---
 # Disabled: the draft model does not fit reliably beside the resident profile
@@ -138,6 +152,7 @@ start_worker() { # <rocr_device> <layers> [extra ds4 arguments...]
     local arg ssd_worker=0
     local -a worker_env=(env
         -u DS4_DIST_DECODE_PROFILE
+        DS4_ROCM_ATTN_COMP_CACHE_F16="${DS4_ROCM_ATTN_COMP_CACHE_F16}"
         DS4_ROCM_WEIGHT_ARENA_CHUNK_MB=256
         DS4_LOCK_FILE="/tmp/ds4-worker-${dev}.lock"
         ROCR_VISIBLE_DEVICES="${dev}")
@@ -207,6 +222,7 @@ sleep 2
 echo "run.sh: starting coordinator on ROCR device ${COORD_DEVICE}, layers ${COORD_LAYERS}; final worker owns output head"
 COORD_ENV=(env
     -u DS4_DIST_DECODE_PROFILE
+    DS4_ROCM_ATTN_COMP_CACHE_F16="${DS4_ROCM_ATTN_COMP_CACHE_F16}"
     DS4_ROCM_WEIGHT_ARENA_CHUNK_MB=256
     DS4_LOCK_FILE="/tmp/ds4-coordinator-${COORD_DEVICE}.lock"
     ROCR_VISIBLE_DEVICES="${COORD_DEVICE}")
@@ -227,6 +243,7 @@ fi
     --ctx "${CTX}" \
     --tokens "${MAX_TOKENS}" \
     --host "${HTTP_HOST}" --port "${HTTP_PORT}" \
+    "${MONITOR_ARGS[@]}" \
     "${TRACE_ARGS[@]}" \
     --role coordinator --layers "${COORD_LAYERS}" \
     "${MTP_ARGS[@]}" \

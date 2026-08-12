@@ -1,7 +1,69 @@
 // DS4 ROCm attention kernels (prefill/decode, raw/mixed KV).
 
+enum {
+    DS4_ROCM_COMPACT_KV_HEAD_DIM = 512u,
+    DS4_ROCM_COMPACT_KV_F32_TAIL = 64u,
+    DS4_ROCM_COMPACT_KV_NOPE =
+        DS4_ROCM_COMPACT_KV_HEAD_DIM - DS4_ROCM_COMPACT_KV_F32_TAIL,
+    DS4_ROCM_COMPACT_KV_ROW_BYTES =
+        DS4_ROCM_COMPACT_KV_NOPE * sizeof(__half) +
+        DS4_ROCM_COMPACT_KV_F32_TAIL * sizeof(float),
+};
+
+template <bool COMP_F16>
+__device__ __forceinline__ static const char *attention_comp_row_bytes_ptr(
+        const float *comp_kv, uint64_t row) {
+    if constexpr (COMP_F16) {
+        return (const char *)comp_kv + row * DS4_ROCM_COMPACT_KV_ROW_BYTES;
+    } else {
+        return (const char *)(comp_kv + row * DS4_ROCM_COMPACT_KV_HEAD_DIM);
+    }
+}
+
 /* Non-causal attention used by the small DSpark draft block. Each query row
  * sees the complete raw-KV ring rather than a causal prefix. */
+template <bool COMP_F16>
+__device__ __forceinline__ static float attention_comp_load(
+        const float *comp_kv, uint64_t index) {
+    if constexpr (COMP_F16) {
+        const uint64_t row = index / DS4_ROCM_COMPACT_KV_HEAD_DIM;
+        const uint32_t dim =
+            (uint32_t)(index - row * DS4_ROCM_COMPACT_KV_HEAD_DIM);
+        const char *row_ptr = attention_comp_row_bytes_ptr<true>(comp_kv, row);
+        if (dim < DS4_ROCM_COMPACT_KV_NOPE) {
+            return __half2float(((const __half *)row_ptr)[dim]);
+        }
+        const float *rope = (const float *)(
+            row_ptr + DS4_ROCM_COMPACT_KV_NOPE * sizeof(__half));
+        return rope[dim - DS4_ROCM_COMPACT_KV_NOPE];
+    } else {
+        return comp_kv[index];
+    }
+}
+
+template <bool COMP_F16>
+__device__ __forceinline__ static float4 attention_comp_load4(
+        const float *comp_kv, uint64_t index) {
+    if constexpr (COMP_F16) {
+        const uint64_t row = index / DS4_ROCM_COMPACT_KV_HEAD_DIM;
+        const uint32_t dim =
+            (uint32_t)(index - row * DS4_ROCM_COMPACT_KV_HEAD_DIM);
+        const char *row_ptr = attention_comp_row_bytes_ptr<true>(comp_kv, row);
+        if (dim < DS4_ROCM_COMPACT_KV_NOPE) {
+            const __half2 *h2 = (const __half2 *)row_ptr + (dim >> 1u);
+            const float2 lo = __half22float2(h2[0]);
+            const float2 hi = __half22float2(h2[1]);
+            return make_float4(lo.x, lo.y, hi.x, hi.y);
+        }
+        const float *rope = (const float *)(
+            row_ptr + DS4_ROCM_COMPACT_KV_NOPE * sizeof(__half));
+        return ((const float4 *)rope)[
+            (dim - DS4_ROCM_COMPACT_KV_NOPE) >> 2u];
+    } else {
+        return ((const float4 *)comp_kv)[index >> 2u];
+    }
+}
+
 __global__ static void attention_noncausal_raw_batch_heads_kernel(
         float *heads,
         const float *sinks,
@@ -139,6 +201,7 @@ __global__ static void attention_prefill_raw_kernel(
     }
 }
 
+template <bool COMP_F16>
 __global__ static void attention_prefill_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -181,9 +244,11 @@ __global__ static void attention_prefill_mixed_kernel(
         float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
         float s = -INFINITY;
         if (add > -1.0e20f) {
-            const float *kvrow = comp_kv + (uint64_t)c * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dot += qh[d] * attention_comp_load<COMP_F16>(
+                    comp_kv, (uint64_t)c * head_dim + d);
+            }
             s = dot * scale + add;
         }
         scores[raw_count + c] = s;
@@ -214,7 +279,10 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        for (uint32_t c = 0; c < visible_comp; c++) {
+            acc += attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)c * head_dim + d) * scores[raw_count + c];
+        }
         oh[d] = acc / denom;
     }
 }
@@ -383,6 +451,7 @@ __global__ static void attention_prefill_mixed_softmax_tile_kernel(
     for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) row[k] /= denom;
 }
 
+template <bool COMP_F16>
 __global__ static void attention_prefill_pack_mixed_kv_kernel(
         float *dst,
         const float *raw_kv,
@@ -395,8 +464,10 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
-    dst[gid] = r < n_tokens ? raw_kv[(uint64_t)r * head_dim + d]
-                             : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    dst[gid] = r < n_tokens
+        ? raw_kv[(uint64_t)r * head_dim + d]
+        : attention_comp_load<COMP_F16>(
+            comp_kv, (uint64_t)(r - n_tokens) * head_dim + d);
 }
 
 __global__ static void attention_prefill_unpack_heads_kernel(
@@ -541,7 +612,67 @@ __device__ __forceinline__ static float attention_dot_f32_vec4_coop_oldhip_w32(
     return (s0 + s1) + (s2 + s3);
 }
 
-template <bool COOPERATIVE_DOT = false>
+__device__ __forceinline__ static float attention_dot_f16_vec4_oldhip(
+        const float *a, const float *b, uint32_t n) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    const float4 *a4 = (const float4 *)a;
+    const __half2 *b2 = (const __half2 *)b;
+    const uint32_t nope4 = DS4_ROCM_COMPACT_KV_NOPE >> 2u;
+    for (uint32_t i = 0; i < nope4; i++) {
+        const float4 av = a4[i];
+        const float2 b01 = __half22float2(b2[2u * i]);
+        const float2 b23 = __half22float2(b2[2u * i + 1u]);
+        s0 += av.x * b01.x;
+        s1 += av.y * b01.y;
+        s2 += av.z * b23.x;
+        s3 += av.w * b23.y;
+    }
+    const float4 *rope4 = (const float4 *)(
+        (const char *)b + DS4_ROCM_COMPACT_KV_NOPE * sizeof(__half));
+    for (uint32_t i = nope4; i < (n >> 2u); i++) {
+        const float4 av = a4[i];
+        const float4 bv = rope4[i - nope4];
+        s0 += av.x * bv.x;
+        s1 += av.y * bv.y;
+        s2 += av.z * bv.z;
+        s3 += av.w * bv.w;
+    }
+    return (s0 + s1) + (s2 + s3);
+}
+
+__device__ __forceinline__ static float attention_dot_f16_vec4_coop_oldhip_w32(
+        const float *a, const float *b, uint32_t n, uint32_t lane) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    const float4 *a4 = (const float4 *)a;
+    const __half2 *b2 = (const __half2 *)b;
+    const uint32_t nope4 = DS4_ROCM_COMPACT_KV_NOPE >> 2u;
+    for (uint32_t i = lane; i < nope4; i += 32u) {
+        const float4 av = a4[i];
+        const float2 b01 = __half22float2(b2[2u * i]);
+        const float2 b23 = __half22float2(b2[2u * i + 1u]);
+        s0 += av.x * b01.x;
+        s1 += av.y * b01.y;
+        s2 += av.z * b23.x;
+        s3 += av.w * b23.y;
+    }
+    const float4 *rope4 = (const float4 *)(
+        (const char *)b + DS4_ROCM_COMPACT_KV_NOPE * sizeof(__half));
+    for (uint32_t i = nope4 + lane; i < (n >> 2u); i += 32u) {
+        const float4 av = a4[i];
+        const float4 bv = rope4[i - nope4];
+        s0 += av.x * bv.x;
+        s1 += av.y * bv.y;
+        s2 += av.z * bv.z;
+        s3 += av.w * bv.w;
+    }
+    s0 = attention_warp_sum_oldhip_w32(s0);
+    s1 = attention_warp_sum_oldhip_w32(s1);
+    s2 = attention_warp_sum_oldhip_w32(s2);
+    s3 = attention_warp_sum_oldhip_w32(s3);
+    return (s0 + s1) + (s2 + s3);
+}
+
+template <bool COOPERATIVE_DOT = false, bool COMP_F16 = false>
 __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
         float *heads,
         const float *q,
@@ -579,15 +710,44 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
             if (valid) {
                 const uint32_t row = raw && raw_cap
                     ? ((raw_start + logical_row) % raw_cap) : logical_row;
-                const float *kv = (raw ? raw_kv : comp_kv) +
-                                  (uint64_t)row * head_dim;
-                float dot = use_vec4
-                    ? attention_dot_f32_vec4_coop_oldhip_w32(qh, kv, head_dim, lane)
-                    : 0.0f;
-                if (!use_vec4) {
-                    for (uint32_t i = lane; i < head_dim; i += 32u)
-                        dot += qh[i] * kv[i];
-                    dot = attention_warp_sum_oldhip_w32(dot);
+                float dot = 0.0f;
+                if (raw) {
+                    const float *kv = raw_kv + (uint64_t)row * head_dim;
+                    dot = use_vec4
+                        ? attention_dot_f32_vec4_coop_oldhip_w32(
+                            qh, kv, head_dim, lane)
+                        : 0.0f;
+                    if (!use_vec4) {
+                        for (uint32_t i = lane; i < head_dim; i += 32u)
+                            dot += qh[i] * kv[i];
+                        dot = attention_warp_sum_oldhip_w32(dot);
+                    }
+                } else {
+                    const float *kv;
+                    if constexpr (COMP_F16) {
+                        kv = (const float *)attention_comp_row_bytes_ptr<true>(
+                            comp_kv, row);
+                    } else {
+                        kv = comp_kv + (uint64_t)row * head_dim;
+                    }
+                    if constexpr (COMP_F16) {
+                        dot = use_vec4
+                            ? attention_dot_f16_vec4_coop_oldhip_w32(
+                                qh, kv, head_dim, lane)
+                            : 0.0f;
+                    } else {
+                        dot = use_vec4
+                            ? attention_dot_f32_vec4_coop_oldhip_w32(
+                                qh, kv, head_dim, lane)
+                            : 0.0f;
+                    }
+                    if (!use_vec4) {
+                        for (uint32_t i = lane; i < head_dim; i += 32u) {
+                            dot += qh[i] * attention_comp_load<COMP_F16>(
+                                comp_kv, (uint64_t)row * head_dim + i);
+                        }
+                        dot = attention_warp_sum_oldhip_w32(dot);
+                    }
                 }
                 s = dot * scale;
                 if (!raw && use_mask && comp_mask) s += comp_mask[logical_row];
@@ -612,10 +772,28 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
         for (uint32_t c = tid; c < n_comp; c += blockDim.x) {
             float s = -3.4e38f;
             if (!(use_mask && comp_mask && comp_mask[c] <= -5.0e29f)) {
-                const float *kv = comp_kv + (uint64_t)c * head_dim;
-                float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+                const float *kv;
+                if constexpr (COMP_F16) {
+                    kv = (const float *)attention_comp_row_bytes_ptr<true>(
+                        comp_kv, c);
+                } else {
+                    kv = comp_kv + (uint64_t)c * head_dim;
+                }
+                float dot = 0.0f;
+                if constexpr (COMP_F16) {
+                    dot = use_vec4
+                        ? attention_dot_f16_vec4_oldhip(qh, kv, head_dim)
+                        : 0.0f;
+                } else {
+                    dot = use_vec4
+                        ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim)
+                        : 0.0f;
+                }
                 if (!use_vec4) {
-                    for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+                    for (uint32_t i = 0; i < head_dim; i++) {
+                        dot += qh[i] * attention_comp_load<COMP_F16>(
+                            comp_kv, (uint64_t)c * head_dim + i);
+                    }
                 }
                 s = dot * scale;
                 if (use_mask && comp_mask) s += comp_mask[c];
@@ -643,12 +821,14 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
             acc += scores[r] * raw_kv[(uint64_t)row * head_dim + d];
         }
         for (uint32_t c = 0; c < n_comp; c++) {
-            acc += scores[n_raw + c] * comp_kv[(uint64_t)c * head_dim + d];
+            acc += scores[n_raw + c] * attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)c * head_dim + d);
         }
         heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
     }
 }
 
+template <bool COMP_F16 = false>
 __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
         float *heads,
         const float *q,
@@ -709,10 +889,28 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     }
     for (uint32_t c = tid; c < comp_count; c += blockDim.x) {
         const uint32_t row = comp_rows[c];
-        const float *kv = comp_kv + (uint64_t)row * head_dim;
-        float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+        const float *kv;
+        if constexpr (COMP_F16) {
+            kv = (const float *)attention_comp_row_bytes_ptr<true>(
+                comp_kv, row);
+        } else {
+            kv = comp_kv + (uint64_t)row * head_dim;
+        }
+        float dot = 0.0f;
+        if constexpr (COMP_F16) {
+            dot = use_vec4
+                ? attention_dot_f16_vec4_oldhip(qh, kv, head_dim)
+                : 0.0f;
+        } else {
+            dot = use_vec4
+                ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim)
+                : 0.0f;
+        }
         if (!use_vec4) {
-            for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+            for (uint32_t i = 0; i < head_dim; i++) {
+                dot += qh[i] * attention_comp_load<COMP_F16>(
+                    comp_kv, (uint64_t)row * head_dim + i);
+            }
         }
         const float s = dot * scale;
         scores[n_raw + c] = s;
@@ -738,12 +936,14 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
         }
         for (uint32_t c = 0; c < comp_count; c++) {
             const uint32_t row = comp_rows[c];
-            acc += scores[n_raw + c] * comp_kv[(uint64_t)row * head_dim + d];
+            acc += scores[n_raw + c] * attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)row * head_dim + d);
         }
         heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
     }
 }
 
+template <bool COMP_F16>
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -820,9 +1020,11 @@ __global__ static void attention_decode_mixed_kernel(
             float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
-                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += qh[d] * attention_comp_load<COMP_F16>(
+                        comp_kv, (uint64_t)c * head_dim + d);
+                }
                 s = dot * scale + add;
             }
             scores[raw_count + c] = s;
@@ -836,17 +1038,28 @@ __global__ static void attention_decode_mixed_kernel(
             if (row < n_score) {
                 float add = 0.0f;
                 const float *kvrow = NULL;
+                uint32_t comp_row = 0u;
+                bool is_comp = false;
                 if (row < raw_count) {
                     kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
                 } else {
                     uint32_t c = row - raw_count;
                     add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
-                    if (add > -1.0e20f) kvrow = comp_kv + (uint64_t)c * head_dim;
+                    if (add > -1.0e20f) {
+                        comp_row = c;
+                        is_comp = true;
+                    }
                 }
                 float s = -INFINITY;
-                if (kvrow) {
+                if (kvrow || is_comp) {
                     float dot = 0.0f;
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) {
+                        const float kv = is_comp
+                            ? attention_comp_load<COMP_F16>(
+                                comp_kv, (uint64_t)comp_row * head_dim + d)
+                            : kvrow[d];
+                        dot += qh[d] * kv;
+                    }
                     const MASK_T mask = ds4_subgroup_mask(threadIdx.x, 8u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
@@ -896,9 +1109,10 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            acc0 += attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)c * head_dim + d0) * s;
+            acc1 += attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)c * head_dim + d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -906,7 +1120,10 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                acc += attention_comp_load<COMP_F16>(
+                    comp_kv, (uint64_t)c * head_dim + d) * scores[raw_count + c];
+            }
             oh[d] = acc / denom;
         }
     }
@@ -998,6 +1215,7 @@ __global__ static void attention_indexed_mixed_scalar_kernel(
     heads[idx] = acc / denom;
 }
 
+template <bool COMP_F16>
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -1087,11 +1305,20 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
             uint32_t row = row0 + qgroup;
             if (row < n_score) {
-                const float *kvrow = row < raw_count
-                    ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                    : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                const bool is_comp = row >= raw_count;
+                const float *kvrow = is_comp
+                    ? NULL
+                    : raw_kv + (uint64_t)raw_rows[row] * head_dim;
+                const uint32_t comp_row = is_comp
+                    ? comp_rows[row - raw_count] : 0u;
+                for (uint32_t d = qlane; d < head_dim; d += 8u) {
+                    const float kv = is_comp
+                        ? attention_comp_load<COMP_F16>(
+                            comp_kv, (uint64_t)comp_row * head_dim + d)
+                        : kvrow[d];
+                    dot += qh[d] * kv;
+                }
                 const MASK_T mask = ds4_subgroup_mask(threadIdx.x, 8u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                     dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
@@ -1139,9 +1366,10 @@ __global__ static void attention_indexed_mixed_kernel(
         }
         for (uint32_t c = 0; c < comp_count; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            acc0 += attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)comp_rows[c] * head_dim + d0) * s;
+            acc1 += attention_comp_load<COMP_F16>(
+                comp_kv, (uint64_t)comp_rows[c] * head_dim + d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -1149,13 +1377,16 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)comp_rows[s] * head_dim + d] * scores[raw_count + s];
+            for (uint32_t s = 0; s < comp_count; s++) {
+                acc += attention_comp_load<COMP_F16>(
+                    comp_kv, (uint64_t)comp_rows[s] * head_dim + d) * scores[raw_count + s];
+            }
             oh[d] = acc / denom;
         }
     }
 }
 
-template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, bool COMP_F16>
 __global__ static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -1258,10 +1489,15 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(
+                    raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_load4<COMP_F16>(
+                    comp_kv,
+                    (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4u);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1318,6 +1554,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
+template <bool COMP_F16>
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -1362,10 +1599,15 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(
+                    raw_kv + (uint64_t)(raw_start + sr) * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_load4<COMP_F16>(
+                    comp_kv,
+                    (uint64_t)(sr - raw_count) * head_dim + c4 * 4u);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1410,10 +1652,15 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(
+                    raw_kv + (uint64_t)(raw_start + sr) * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_load4<COMP_F16>(
+                    comp_kv,
+                    (uint64_t)(sr - raw_count) * head_dim + c4 * 4u);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1442,6 +1689,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
+template <bool COMP_F16>
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -1534,10 +1782,15 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(
+                    raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_load4<COMP_F16>(
+                    comp_kv,
+                    (uint64_t)(sr - raw_count) * head_dim + c4 * 4u);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1570,10 +1823,15 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(
+                    raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_load4<COMP_F16>(
+                    comp_kv,
+                    (uint64_t)(sr - raw_count) * head_dim + c4 * 4u);
+            }
         }
         __syncthreads();
         if (valid_head) {

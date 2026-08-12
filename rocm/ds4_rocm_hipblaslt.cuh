@@ -132,6 +132,6 @@ static int hipblaslt_gemm_tn_f16_out_f16(
                                         out, p->c_desc,
                                         out, p->d_desc,
                                         &p->algo,
-                                        NULL, 0, 0),
+                                        NULL, 0, cuda_decode_stream()),
                         label ? label : "gemm");
 }

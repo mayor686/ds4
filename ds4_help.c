@@ -334,6 +334,8 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
+    opt(fp, c, "--monitor-port N", "Enable the private monitoring dashboard and metrics listener on this port.");
+    opt(fp, c, "--monitor-host HOST", "Monitoring listener address. Default: 127.0.0.1");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
@@ -369,6 +371,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
+    opt(fp, c, "--repeat-prompt", "Repeat input tokens to ctx-max for synthetic long-context benchmarks.");
     fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
@@ -377,6 +380,10 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--step-mul F", "Multiplicative step. Default: 1");
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "--mtp FILE", "Optional DSpark support GGUF.");
+    opt(fp, c, "--dspark", "Enable DSpark speculative decode with --mtp.");
+    opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1. Default: 0.9");
+    opt(fp, c, "--show-output", "Print generated token IDs and decoded text.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);

@@ -37,6 +37,12 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   tool-call mapping, disk KV cache policy.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
 - `metal/*.metal`: compute kernels.
+- `rocm/*.cuh`: ROCm (HIP) backend, written for wave32 (gfx1151). The gfx906
+  (Vega 20, wave64) port adds `rocm/ds4_rocm_wmma_gfx906.cuh` (rocWMMA shim)
+  and wave64-safe sync masks; see `PORTING-GFX906.md` for the full porting
+  notes, device map, and the residual race worked around with
+  `AMD_SERIALIZE_KERNEL=1`. ROCm-only edits stay behind
+  `#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)` so CUDA is untouched.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 

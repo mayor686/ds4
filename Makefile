@@ -60,6 +60,12 @@ ifeq ($(ROCM_ARCH),gfx906)
 ROCM_CPPFLAGS += -DDS4_GFX906
 endif
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ifeq ($(ROCM_ARCH),gfx906)
+# HIP cannot capture the legacy NULL stream.  Vega 20 decode graphs use the
+# per-thread default stream, which preserves FIFO ordering while remaining
+# capturable by hipStreamBeginCapture.
+ROCM_CFLAGS += -fgpu-default-stream=per-thread
+endif
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
@@ -226,7 +232,7 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
 rocm-regression: tests/rocm_long_context_smoke
-	./tests/rocm_long_context_smoke
+	DS4_TEST_ROCM_F16_CACHE=1 ./tests/rocm_long_context_smoke
 ifeq ($(ROCM_ARCH),gfx906)
 	$(MAKE) tests/gfx906_wmma_test ROCM_ARCH=gfx906
 	./tests/gfx906_wmma_test

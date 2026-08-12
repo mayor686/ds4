@@ -74,6 +74,8 @@ int ds4_dist_session_create(
         char *err,
         size_t errlen);
 void ds4_dist_session_free(ds4_dist_session *d);
+int ds4_dist_session_metrics(ds4_dist_session *d,
+                             ds4_distributed_metrics *out);
 
 /* Returns 1 when the coordinator has full layer coverage, 0 when workers are
  * still missing, and -1 for configuration or internal errors.
@@ -96,6 +98,21 @@ int ds4_dist_session_eval(
         ds4_session *owner,
         const ds4_tokens *checkpoint,
         int token,
+        float *logits,
+        char *err,
+        size_t errlen);
+
+/* Greedy distributed DSpark cycle. The final worker owns the support model
+ * and returns a proposal; all stages verify the suffix as one tiny batch. */
+int ds4_dist_session_eval_speculative_argmax(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        int first_token,
+        int max_tokens,
+        int eos_token,
+        int *accepted,
+        int accepted_cap,
         float *logits,
         char *err,
         size_t errlen);

@@ -2,6 +2,7 @@
 #define DS4_GPU_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -59,6 +60,14 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+int ds4_gpu_tensor_pack_comp_kv_f16_rope_f32(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint32_t n_rows, uint32_t head_dim, uint32_t n_rot);
+int ds4_gpu_tensor_unpack_comp_kv_f16_rope_f32(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint32_t n_rows, uint32_t head_dim, uint32_t n_rot);
 int ds4_gpu_moe_handoff_pack_tensor(
         ds4_gpu_tensor       *packed,
         const ds4_gpu_tensor *ffn_norm,
@@ -148,6 +157,8 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
                                          int n_ranges,
                                          int from_main_map);
 uint64_t ds4_gpu_tier_free_vram(int logical_tier);
+int ds4_gpu_device_info(int logical_tier, char *name, size_t name_cap,
+                        uint64_t *memory_bytes);
 int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                          int *out_device_id, void **out_device_ptr);
 int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);

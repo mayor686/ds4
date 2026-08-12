@@ -453,3 +453,359 @@ finché il sistema non viene avviato con una configurazione IOMMU compatibile e
 un microbenchmark RCCL TP2 non completa correttamente. Il PP6 bilanciato offre
 nel frattempo un miglioramento verificato senza modificare kernel, formato dei
 pesi o semantica del modello.
+
+## Aggiornamento 10 agosto 2026: modello 0731 e ottimizzazione Routed-MoE
+
+Questa sezione fotografa la configurazione corrente e non sostituisce le misure
+storiche riportate sopra. Il benchmark usa il GGUF 0731, pesi residenti, sei
+processi ROCm (uno per GPU), attivazioni distribuite FP16, finestra 5 e il
+seguente split:
+
+```text
+ROCR 3, Radeon Pro VII 16 GiB: layer 0:5, coordinatore
+ROCR 0, Radeon VII     16 GiB: layer 6:12
+ROCR 1, Radeon Pro VII 16 GiB: layer 13:19
+ROCR 4, Radeon Pro VII 16 GiB: layer 20:26
+ROCR 5, Radeon VII     16 GiB: layer 27:33
+ROCR 2, Radeon Graphics 32 GiB: layer 34:42 e output head
+```
+
+### Causa del limite di prefill gfx906
+
+Vega 20 non dispone di istruzioni MFMA. La compatibilità rocWMMA implementata
+per gfx906 è quindi uno shim software corretto numericamente, ma non un percorso
+di accelerazione. Nel prefill Routed-MoE il vecchio dispatch inviava gli esperti
+più frequenti proprio a questo shim, rallentando il percorso che avrebbe dovuto
+essere veloce.
+
+La correzione mantiene su gfx906 il kernel expert-tiled già disponibile. È
+limitata a `DS4_GFX906`; le architetture ROCm con rocWMMA nativo non cambiano.
+`DS4_ROCM_ENABLE_EMULATED_MOE_WMMA=1` ripristina il percorso precedente per i
+test di regressione.
+
+| Percorso, frontiera 8K | Prefill | Decode | Variazione prefill |
+|---|---:|---:|---:|
+| rocWMMA emulato precedente | 89,37 token/s | 9,54 token/s | riferimento |
+| expert-tiled gfx906 | **159,81 token/s** | 9,54 token/s | **+78,8%** |
+
+Il tempo del prefill diminuisce del 44,1%. Il decode non cambia perché il ramo
+hot-expert riguarda il batch di prefill, non il matvec a singolo token.
+
+Il confronto dei logits completi è stato ripetuto su tre prompt da 2.295,
+2.697 e 5.355 token. I due percorsi veloci hanno sempre lo stesso argmax e una
+sovrapposizione top-20 di 18/20, 18/20 e 19/20. Rispetto al percorso
+`--quality`, expert-tiled risulta più vicino in due prompt su tre. Non emerge
+quindi una perdita sistematica che giustifichi il costo del rocWMMA emulato.
+
+### Scaling con la lunghezza del contesto
+
+`ds4-bench --repeat-prompt` permette di costruire una frontiera lunga realmente
+elaborata, invece di limitarsi ad allocare un KV capiente. La prova seguente
+usa una frontiera sintetica di 65.536 token, `ctx-alloc=300000`, chunk 256 e 32
+token greedy:
+
+| Frontiera | Prefill | Decode | Variazione rispetto a 8K |
+|---|---:|---:|---:|
+| 8.192 token | 159,81 token/s | 9,54 token/s | riferimento |
+| 65.536 token | **118,18 token/s** | **8,82 token/s** | prefill -26,1%; decode -7,5% |
+
+Il calo non annulla il beneficio Routed-MoE: riflette la quota crescente di
+attenzione e accesso al KV con l'aumentare della posizione.
+
+È stata inoltre avviata una frontiera effettiva da 300.000 token con
+`ctx-alloc=700000`, senza SSD. I sei processi hanno allocato il contesto,
+completato la route e processato il prefill per oltre 13 minuti senza OOM,
+disconnessioni o errori numerici. La misura di throughput è stata interrotta
+volontariamente quando un sensore GPU ha raggiunto 95 °C; le altre schede erano
+tra 77 e 85 °C. Un run completo richiederebbe circa 60-90 minuti nelle attuali
+condizioni e sarebbe dominato dal throttling. Il risultato 300K sostenuto va
+quindi ripetuto dopo la sostituzione del dissipatore; non viene inventato un
+valore estrapolato.
+
+### Profilo distribuito a 64K
+
+Le quote sono calcolate sul solo tempo `eval` dei layer. Nel prefill gli stadi
+si sovrappongono in pipeline; nel decode sono seriali. `downstream_wait`
+include il lavoro degli stadi successivi e non viene sommato alle quote.
+
+| Layer | GPU | VRAM | Prefill per chunk | Quota prefill | Decode per token | Quota decode |
+|---|---|---:|---:|---:|---:|---:|
+| 0:5 | Radeon Pro VII | 16 GiB | 1.062,7 ms | 12,3% | 13,37 ms | 12,0% |
+| 6:12 | Radeon VII | 16 GiB | 2.102,7 ms | **24,3%** | 18,69 ms | 16,8% |
+| 13:19 | Radeon Pro VII | 16 GiB | 1.300,3 ms | 15,0% | 17,62 ms | 15,9% |
+| 20:26 | Radeon Pro VII | 16 GiB | 1.407,7 ms | 16,3% | 19,51 ms | 17,6% |
+| 27:33 | Radeon VII | 16 GiB | 1.214,4 ms | 14,0% | 17,44 ms | 15,7% |
+| 34:42 + output | Radeon Graphics | 32 GiB | 1.557,2 ms | 18,0% | 24,36 ms | **21,9%** |
+| **Totale seriale equivalente** | — | — | **8.644,9 ms** | **100,0%** | **110,98 ms** | **100,0%** |
+
+Lo stadio `6:12` limita il prefill e coincide con la GPU che ha mostrato la
+temperatura anomala. L'utilizzo della pipeline è 68,5%. Un bilanciamento
+perfetto puramente matematico avrebbe il 45,9% di margine, ma non è realizzabile
+con layer interi e gli attuali limiti di VRAM.
+
+Con i vincoli misurati (`max=7,7,7,7,7,10` layer), il modello lineare propone
+`7,6,7,6,7,10` e stima +16,7% di prefill a 64K. La proposta sposta un layer
+dalla GPU termicamente limitata e non viene applicata al launcher: va ripetuto
+il profilo dopo il nuovo dissipatore, perché il costo per layer cambierà.
+
+### DSpark con il kernel corretto
+
+Il confronto immediato a GPU già calde usa frontiera 8K, 256 token, chunk 256
+e identico split. In questo modo la differenza non viene attribuita a un avvio
+più freddo:
+
+| Modalità | Prefill | Decode | Differenza decode |
+|---|---:|---:|---:|
+| standard | 143,90 token/s | **10,04 token/s** | riferimento |
+| DSpark, soglia 0,9 | 138,41 token/s | **6,54 token/s** | **-34,9%** |
+
+Sulle gfx906 il costo di proposta e verifica supera il lavoro evitato anche con
+un buon acceptance rate. DSpark resta disponibile per ricerca, ma non deve
+essere attivato nel profilo velocità.
+
+Un secondo confronto ha esteso la generazione forzata a 1.024 token:
+
+| Modalità, 1.024 token | Prefill | Decode | Tempo decode stimato |
+|---|---:|---:|---:|
+| standard | 167,22 token/s | **9,19 token/s** | 111,43 s |
+| DSpark, soglia 0,9 | 161,71 token/s | **7,30 token/s** | 140,27 s |
+
+DSpark rimane quindi più lento del 20,6%. In questo run produce 622 token di
+draft e ne accetta 614 (98,71%), con draft che arrivano a 5 token. Riduce le
+chiamate target da 1.024 a 552, ma spende 19,78 s nella proposta, 74,61 s nella
+verifica batch e 0,98 s nei rollback. Il lavoro risparmiato non ripaga questi
+costi sulle gfx906.
+
+Il 98,71% non va interpretato come acceptance rappresentativa di 1.024 token
+utili: la continuazione DSpark emette il token EOS alla posizione di output 318
+e il benchmark prestazionale continua deliberatamente oltre EOS. I successivi
+705 token degenerano nell'alternanza dei token 26/67 (`8a8a...`), estremamente
+facile da proporre. Anche in questa condizione artificialmente favorevole
+DSpark non supera il decode standard. Il run breve da 256 token, interamente
+precedente all'EOS, resta il confronto qualitativamente più significativo.
+
+### DSpark al crescere della frontiera di contesto
+
+Il confronto è stato ripetuto a 16.384 token di input effettivi, mantenendo
+chunk 256, `ctx-alloc=300000`, finestra 5 e 256 token di output. Un cooldown
+controllato ha fatto partire il caso DSpark da 75 °C, senza power cap o modifica
+della ventola:
+
+| Frontiera 16K | Prefill | Decode | Tempo decode |
+|---|---:|---:|---:|
+| standard | 148,97 token/s | **9,34 token/s** | 27,41 s |
+| DSpark, soglia 0,9 | 156,93 token/s | **6,23 token/s** | 41,09 s |
+
+DSpark è **33,3% più lento**. Su 253 chiamate speculative, 250 non producono
+alcun draft; vengono proposti e accettati soltanto 3 token. La copertura utile
+è quindi 3/256, cioè **1,17%**. Il support model impiega 13,72 s, mentre il
+rallentamento end-to-end rispetto alla baseline è 13,68 s: la regressione è
+quasi interamente spiegata dalla proposta che non riesce a generare draft.
+
+Il profilo isola il costo sulla GPU finale da 32 GiB: lo stadio `34:42+output`
+sale da 21,86 a 75,52 ms/token; gli altri cinque stadi restano sostanzialmente
+invariati. A questa frontiera la verifica costa appena 0,33 s, perché quasi non
+riceve batch speculativi.
+
+È stato completato anche il baseline a 32.768 token: 144,61 token/s di prefill
+e 8,79 token/s di decode. Il corrispondente DSpark è stato interrotto durante
+il prefill quando la GPU critica ha raggiunto 95 °C, perciò non viene riportato
+un numero incompleto. Le modalità 32K e 64K, con cooldown tra i casi e variante
+`-only`, restano pronte per il retest dopo la sostituzione del dissipatore.
+
+### CPU ed expert parallelism
+
+Il trasporto delle attivazioni richiede circa 0,15-0,17 ms per hop nel decode,
+meno dell'1% del tempo di calcolo complessivo. Tokenizzazione, socket e prefetch
+worker sono già eseguiti lato CPU; il prefetch di ricezione a profondità 2 è
+attivo. Spostare interi layer sulla CPU aggiungerebbe letture dalla RAM e due
+sincronizzazioni PCIe a un percorso seriale, peggiorando la latenza.
+
+Il backend ROCm dispone ora delle primitive `owned expert` necessarie a
+filtrare gli esperti locali, conservare gli output dei sei slot e combinarli
+nello stesso ordine FP32 del backend CUDA. La regressione GPU prova tutte le 64
+possibili assegnazioni home/peer dei sei slot. Queste primitive sono groundwork
+e non attivano da sole l'Expert Parallel: `ds4_gpu_init_multi()` accetta ancora
+una sola GPU per processo, mentre il launcher gfx906 usa un processo per GPU in
+pipeline parallel. Mancano quindi peer-copy/all-reduce fra device nello stesso
+engine e il relativo scheduler. Attivare il flag TP senza quel refactoring non
+sarebbe una prova prestazionale, ma un percorso non supportato.
+
+Una possibile ricerca futura è assegnare un esperto routed alla CPU in parallelo
+ai cinque eseguiti dalla GPU durante il solo decode. Prima di implementarla
+servono un kernel ROCm che escluda gli esperti non posseduti e un microbenchmark
+che dimostri che l'esperto CPU termina entro la finestra GPU. Senza questo gate,
+l'offload CPU rischia di trasformarsi nel nuovo collo di bottiglia.
+
+### File e riproducibilità
+
+- runner: `benchmark-gfx906-0731.sh`;
+- analisi: `speed-bench/distributed_profile.py`;
+- confronto logits: `speed-bench/compare_logits.py`;
+- 8K expert-tiled: `.ds4-benchmarks/gfx906-0731/20260810-210421-chunk256`;
+- 8K rocWMMA emulato: `.ds4-benchmarks/gfx906-0731/20260810-210611-legacy-moe-wmma`;
+- 64K: `.ds4-benchmarks/gfx906-0731/20260810-211325-long64k`;
+- 300K avviato e interrotto per limite termico:
+  `.ds4-benchmarks/gfx906-0731/20260810-212700-long300k`;
+- DSpark: `.ds4-benchmarks/gfx906-0731/20260810-212309-dspark256`;
+- baseline/DSpark da 1.024 token:
+  `.ds4-benchmarks/gfx906-0731/20260810-225512-dspark-long`;
+- baseline 16K: `.ds4-benchmarks/gfx906-0731/20260810-231826-dspark-context16k`;
+- DSpark 16K dopo cooldown:
+  `.ds4-benchmarks/gfx906-0731/20260810-232315-dspark-context16k-only`;
+- baseline 32K e DSpark interrotto termicamente:
+  `.ds4-benchmarks/gfx906-0731/20260810-230626-dspark-context32k`;
+- baseline termico abbinato: `.ds4-benchmarks/gfx906-0731/20260810-212511-chunk256`.
+
+## Aggiornamento 11 agosto 2026: graph, MoE decode e KV-cache lunga
+
+I punti seguenti sono stati misurati sullo stesso GGUF 0731 e sullo split
+`6+7+7+7+7+9` descritto sopra. Il punto 6 (batching di più richieste) è stato
+deliberatamente escluso.
+
+### HIP Graph nel decode
+
+HIP su Vega 20 non può catturare lo stream legacy nullo. La build gfx906 usa
+quindi il default stream per-thread e il backend dispone di warm-up, capture,
+replay e invalidazione del grafo. La cattura funziona, ma il confronto a
+frontiera 1K non mostra un vantaggio ripetibile:
+
+| Percorso | Prefill | Decode |
+|---|---:|---:|
+| eager | 108,11 token/s | 11,99 token/s |
+| HIP Graph | 107,59 token/s | 12,00 token/s |
+| variazione Graph | -0,48% | +0,08% |
+
+Il costo di lancio è quindi già una frazione trascurabile del decode. HIP Graph
+resta diagnostico e opt-in con `DS4_ROCM_DECODE_GRAPHS=1`; non viene imposto al
+profilo di produzione.
+
+### Profiler del Routed-MoE a singolo token
+
+Il profiler inserito nel percorso IQ2/Q2 reale mostra, sul coordinatore e dopo
+384 chiamate, 142,611 ms cumulativi nel Routed-MoE:
+
+| Fase Routed-MoE | Tempo cumulativo | Percentuale MoE |
+|---|---:|---:|
+| quantizzazione Q8 dell'input | 4,163 ms | 2,92% |
+| proiezioni gate/up + SwiGLU | 100,810 ms | **70,69%** |
+| quantizzazione Q8 intermedia | 4,225 ms | 2,96% |
+| proiezione down | 33,413 ms | **23,43%** |
+| **Totale** | **142,611 ms** | **100,00%** |
+
+L'oggetto gfx906 contiene istruzioni `v_dot4_i32_i8`: il percorso sfrutta già
+il dot-product intero nativo disponibile su Vega 20. Sono stati provati il
+caricamento Q8 condiviso fra gate/up e geometrie da 192 thread; nessuno dei due
+ha prodotto un vantaggio ripetibile e le modifiche sono state scartate. Il
+target utile rimane quindi una fusione più profonda gate/up, non la riduzione
+dei due passaggi di quantizzazione che insieme valgono meno del 6% del MoE.
+
+### Esperimenti FP16 sulla KV-cache: esito e rollback di produzione
+
+La prima variante ha conservato tutta la cache di attenzione compressa in
+FP16. A 16K misurava 172,46 token/s di prefill e 10,19 token/s di decode,
+contro 157,21 e 9,41 token/s in FP32. Il guadagno era reale, ma anche il drift:
+su 129.280 logit dopo 2.697 token il valore RMS era 0,786, l'overlap top-20
+18/20 e la generazione greedy divergeva al token 21.
+
+Il test dimensionale ha poi isolato la causa: arrotondare a FP16 i primi 448
+valori noPE, già passati dal round-trip FP8 del modello, non cambia alcun logit;
+arrotondare i 64 valori RoPE riproduce invece quasi tutto il drift. È stata
+quindi implementata e verificata una seconda variante mista:
+
+```text
+448 valori noPE FP16 + 64 valori RoPE FP32 = 1.152 byte/riga
+cache FP32 di riferimento                  = 2.048 byte/riga
+```
+
+La regressione isolata dell'attenzione mista ha errore massimo `2,53e-7`. Nel
+modello completo il drift scende a RMS 0,0648, con stesso argmax e overlap
+top-20 20/20. Non è però bit-identico e la generazione greedy diverge ancora al
+token 21. L'A/B di 256 token mostra inoltre un compromesso sfavorevole:
+
+| Cache, frontiera 1K | Prefill | Decode | KV allocata | Token greedy |
+|---|---:|---:|---:|---|
+| FP32 | 109,30 token/s | **13,11 token/s** | 3,89 GiB | riferimento |
+| noPE FP16 + RoPE FP32 | **112,51 token/s** | 12,86 token/s | 2,53 GiB | diverge al 21 |
+| variazione | +2,94% | **-1,91%** | -34,96% | non accettata |
+
+È stata provata anche una codifica noPE normalizzata con sette esponenti
+potenza-di-due per riga, capace di ricostruire senza perdita i valori prodotti
+dal round-trip FP8. Il confronto completo resta però identico alla variante
+mista semplice (RMS 0,0648): il drift residuo deriva dal diverso ordine/FMA
+generato nei kernel compatti, non dalla precisione dei valori in cache. Una
+espansione preventiva in FP32 eliminerebbe il vantaggio e non è stata mantenuta.
+
+Conclusione: la cache compatta resta soltanto un percorso sperimentale; non è
+abilitata dai launcher. `run-speed.sh` usa FP32 e 700K token mantenendo lo split
+validato `0:5 + 6:12 + 13:19 + 20:26 + 27:33 + 34:42+output`. Cambiare i
+confini in `6x5 + 30:42+output` conserva l'argmax sul prompt di controllo, ma
+porta l'RMS dei logits a 0,751 e fa divergere la sequenza greedy al token 21;
+per questo il riequilibrio più aggressivo è stato scartato.
+`run-context.sh` mantiene FP32 a 1M token tramite SSD streaming e una cache
+esatta di 156 esperti. Il valore copre due volte il working set routed del
+coordinatore da 13 layer; la configurazione iniziale a 72 esperti pianificava
+14,37 GiB per worker ma risultava sotto tale soglia sul coordinatore. Il worker
+più pesante (`37:42+output`) con 156 esperti pianifica 15,44 GiB e completa
+l'allocazione sulla Radeon VII da 16 GiB.
+La capacità residente 700K è quindi nuovamente disponibile senza FP16 e senza
+SSD streaming; il percorso compatto non è necessario nel launcher di velocità.
+La correzione del report per-slice misura, a 700K, 13,73 GiB pianificati sul
+coordinator, 14,52-14,96 GiB sui worker da 16 GiB e 19,60 GiB sul worker finale
+da 32 GiB. Avvio, route distribuita, creazione sessione e generazione breve sono
+riusciti. Il dump completo di 129.280 logits è bit-identico al riferimento
+FP32 (`SHA-256 58be30284f82d98cd79d0d95222f5642deff38df6c8eae2c40c4b3837e08b7a0`).
+
+Il benchmark `long64k-700` è stato interrotto senza riportare throughput quando
+la GPU termicamente critica ha raggiunto 87 °C edge e 115 °C junction. Aveva
+già allocato 700K, costruito la frontiera sintetica da 65.536 token e completato
+la route, senza OOM; la prova di riempimento lungo resta rinviata al nuovo
+dissipatore. Risultati: `.ds4-benchmarks/gfx906-0731/20260811-102055-logits-f32`
+e `.ds4-benchmarks/gfx906-0731/20260811-102251-long64k-700`.
+
+Sono state provate anche geometrie alternative del kernel IQ2 gate/up senza
+cambiare l'ordine aritmetico delle singole righe. Tutte producono gli stessi
+256 token del riferimento, ma 128 thread scende a 12,71 token/s, 512 thread a
+12,99 token/s e otto righe per gruppo a 11,94 token/s, contro 13,02 token/s del
+kernel corrente a 256 thread e quattro righe. Anche queste varianti sono state
+scartate: la geometria esistente è la migliore fra quelle misurate.
+
+### Stato dell'Expert Parallel ROCm
+
+Sono implementati e compilati:
+
+- filtro/localizzazione delle coppie token-esperto possedute;
+- decode owned IQ2/Q2 con conservazione dei sei output per-slot;
+- packing esatto 6→4 e combinazione home/peer;
+- combinazione batch per il prefill;
+- regressione GPU delle 64 mappe di ownership.
+
+Non è ancora corretto dichiarare un throughput EP: l'engine ROCm resta
+single-device e il PP6 corrente comunica solo attivazioni fra processi. Il
+passo successivo, separato da questi kernel, è rendere multi-device il backend
+ROCm e aggiungere peer-copy/all-reduce. Finché ciò non avviene, le primitive
+restano inattive e non possono peggiorare il percorso residente normale.
+
+### Risultati riproducibili dell'11 agosto
+
+- eager/Graph: `.ds4-benchmarks/gfx906-0731/20260811-003040-decode-eager` e
+  `.ds4-benchmarks/gfx906-0731/20260811-002935-decode-graph`;
+- profiler MoE: `.ds4-benchmarks/gfx906-0731/20260811-003515-moe-profile`;
+- FP16 completo 1K: `.ds4-benchmarks/gfx906-0731/20260811-074317-decode-f16`;
+- FP32 1K: `.ds4-benchmarks/gfx906-0731/20260811-074215-decode-base`;
+- FP16 16K: `.ds4-benchmarks/gfx906-0731/20260811-070746-long16k`;
+- FP32 16K: `.ds4-benchmarks/gfx906-0731/20260811-071701-long16k-f32`;
+- logits FP32/FP16:
+  `.ds4-benchmarks/gfx906-0731/20260811-071351-logits-f32` e
+  `.ds4-benchmarks/gfx906-0731/20260811-071433-logits-f16`;
+- cache mista FP32/FP16 e riferimento abbinato:
+  `.ds4-benchmarks/gfx906-0731/20260811-090114-decode-f16` e
+  `.ds4-benchmarks/gfx906-0731/20260811-090019-decode-f32`;
+- prova FP16 scalata lossless (stesso RMS della cache mista semplice):
+  `.ds4-benchmarks/gfx906-0731/20260811-093852-logits-f16`;
+- logit FP32 finali, identici bit per bit al riferimento (RMS e massimo 0):
+  `.ds4-benchmarks/gfx906-0731/20260811-092919-logits-f32`;
+- geometrie IQ2 corrette: `.ds4-benchmarks/gfx906-0731/20260811-091631-moe-iq2-rows4`,
+  `.ds4-benchmarks/gfx906-0731/20260811-091724-moe-iq2-rows8`,
+  `.ds4-benchmarks/gfx906-0731/20260811-092152-decode-f32` e
+  `.ds4-benchmarks/gfx906-0731/20260811-092259-decode-f32`.

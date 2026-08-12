@@ -17,6 +17,20 @@ static cudaEvent_t g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+
+/* gfx906 decode kernels are compiled for the per-thread default stream.  HIP
+ * forbids capture on the legacy NULL stream, while hipStreamPerThread keeps
+ * the eager ordering semantics and is graph-capturable. */
+static inline cudaStream_t cuda_decode_stream(void) {
+#if defined(__HIP_PLATFORM_AMD__) && defined(DS4_GFX906)
+    return hipStreamPerThread;
+#else
+    return (cudaStream_t)0;
+#endif
+}
+
+static int g_rocm_decode_graph_capturing;
+
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
@@ -5923,6 +5937,9 @@ extern "C" int ds4_gpu_init(void) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
         const cublasMath_t math_mode = g_quality_mode ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
+#if defined(__HIP_PLATFORM_AMD__) && defined(DS4_GFX906)
+        (void)hipblasSetStream(g_cublas, cuda_decode_stream());
+#endif
         g_cublas_ready = 1;
     }
 #ifdef __HIP_PLATFORM_AMD__
@@ -5937,6 +5954,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    ds4_gpu_decode_graphs_invalidate();
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
@@ -6129,7 +6147,7 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    (const char *)src->ptr + src_offset,
                                    (size_t)bytes,
                                    cudaMemcpyDeviceToDevice,
-                                   0),
+                                   cuda_decode_stream()),
                    "tensor copy enqueue");
 }
 
@@ -6137,6 +6155,229 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
 extern "C" int ds4_gpu_commands_active(void) { return 0; }
+
+#if defined(__HIP_PLATFORM_AMD__) && defined(DS4_GFX906)
+enum {
+    DS4_ROCM_DECODE_GRAPH_LAYERS = 64u,
+    DS4_ROCM_DECODE_GRAPH_ISLANDS = 2u,
+    DS4_ROCM_DECODE_GRAPH_VARIANTS = 4u,
+};
+
+typedef struct {
+    ds4_decode_graph_key key;
+    hipGraphExec_t exec;
+    int state; /* 0 empty, 1 warmed, 2 ready, 3 retired */
+    uint64_t hits;
+} ds4_rocm_decode_graph_entry;
+
+static ds4_rocm_decode_graph_entry
+    g_rocm_decode_graphs[DS4_ROCM_DECODE_GRAPH_LAYERS]
+                        [DS4_ROCM_DECODE_GRAPH_ISLANDS]
+                        [DS4_ROCM_DECODE_GRAPH_VARIANTS];
+static uint64_t g_rocm_decode_graph_captures;
+static uint64_t g_rocm_decode_graph_replays;
+
+static int rocm_env_false(const char *s) {
+    return s && s[0] &&
+           (s[0] == '0' || strcasecmp(s, "off") == 0 ||
+            strcasecmp(s, "no") == 0 || strcasecmp(s, "false") == 0);
+}
+
+static int rocm_env_true(const char *s) {
+    return s && s[0] && !rocm_env_false(s);
+}
+
+extern "C" int ds4_gpu_decode_graphs_supported(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        initialized = 1;
+        const char *s = getenv("DS4_ROCM_DECODE_GRAPHS");
+        enabled = rocm_env_true(s);
+        if (s && s[0] && !enabled) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "DS4_ROCM_DECODE_GRAPHS=%s - "
+                    "decode graph capture disabled\n",
+                    s);
+        }
+    }
+    return enabled;
+}
+
+static void rocm_decode_graph_entry_retire(
+        ds4_rocm_decode_graph_entry *entry) {
+    if (!entry) return;
+    if (entry->exec) {
+        (void)hipGraphExecDestroy(entry->exec);
+        entry->exec = NULL;
+    }
+    entry->state = 3;
+}
+
+static ds4_rocm_decode_graph_entry *rocm_decode_graph_find(
+        const ds4_decode_graph_key *key) {
+    if (!key || key->il >= DS4_ROCM_DECODE_GRAPH_LAYERS ||
+        key->island >= DS4_ROCM_DECODE_GRAPH_ISLANDS) {
+        return NULL;
+    }
+    ds4_rocm_decode_graph_entry *empty = NULL;
+    for (uint32_t v = 0; v < DS4_ROCM_DECODE_GRAPH_VARIANTS; v++) {
+        ds4_rocm_decode_graph_entry *entry =
+            &g_rocm_decode_graphs[key->il][key->island][v];
+        if (entry->state != 0 &&
+            memcmp(&entry->key, key, sizeof(*key)) == 0) {
+            return entry;
+        }
+        if (entry->state == 0 && !empty) empty = entry;
+    }
+    if (empty) memcpy(&empty->key, key, sizeof(*key));
+    return empty;
+}
+
+extern "C" int ds4_gpu_decode_graph_begin(
+        const ds4_decode_graph_key *key) {
+    if (!key || !ds4_gpu_decode_graphs_supported() ||
+        g_rocm_decode_graph_capturing) {
+        return -1;
+    }
+    ds4_rocm_decode_graph_entry *entry = rocm_decode_graph_find(key);
+    if (!entry || entry->state == 3) return -1;
+    if (entry->state == 0) {
+        entry->state = 1; /* First pass warms lazy scratch allocations. */
+        return -1;
+    }
+    if (entry->state == 2) {
+        const hipError_t err = hipGraphLaunch(entry->exec,
+                                              cuda_decode_stream());
+        if (err != hipSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "decode graph replay failed "
+                    "(layer=%u island=%u): %s\n",
+                    key->il, key->island, hipGetErrorString(err));
+            (void)hipGetLastError();
+            rocm_decode_graph_entry_retire(entry);
+            return -1;
+        }
+        entry->hits++;
+        g_rocm_decode_graph_replays++;
+        return 1;
+    }
+    const hipError_t err = hipStreamBeginCapture(
+            cuda_decode_stream(), hipStreamCaptureModeGlobal);
+    if (err != hipSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "decode graph begin failed "
+                "(layer=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGetLastError();
+        rocm_decode_graph_entry_retire(entry);
+        return -1;
+    }
+    g_rocm_decode_graph_capturing = 1;
+    return 0;
+}
+
+extern "C" int ds4_gpu_decode_graph_end(
+        const ds4_decode_graph_key *key) {
+    if (!key || !g_rocm_decode_graph_capturing) return -1;
+    g_rocm_decode_graph_capturing = 0;
+    hipGraph_t graph = NULL;
+    hipError_t err = hipStreamEndCapture(cuda_decode_stream(), &graph);
+    ds4_rocm_decode_graph_entry *entry = rocm_decode_graph_find(key);
+    if (err != hipSuccess || !graph || !entry) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "decode graph capture failed "
+                "(layer=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGetLastError();
+        if (graph) (void)hipGraphDestroy(graph);
+        rocm_decode_graph_entry_retire(entry);
+        return -1;
+    }
+    hipGraphExec_t exec = NULL;
+    err = hipGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    (void)hipGraphDestroy(graph);
+    if (err != hipSuccess || !exec) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "decode graph instantiate failed "
+                "(layer=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGetLastError();
+        rocm_decode_graph_entry_retire(entry);
+        return -1;
+    }
+    err = hipGraphLaunch(exec, cuda_decode_stream());
+    if (err != hipSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "decode graph first launch failed "
+                "(layer=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGraphExecDestroy(exec);
+        (void)hipGetLastError();
+        rocm_decode_graph_entry_retire(entry);
+        return -1;
+    }
+    entry->exec = exec;
+    entry->state = 2;
+    g_rocm_decode_graph_captures++;
+    if (getenv("DS4_ROCM_DECODE_GRAPH_LOG")) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "decode graph captured layer=%u "
+                "island=%u total=%llu\n",
+                key->il, key->island,
+                (unsigned long long)g_rocm_decode_graph_captures);
+    }
+    return 0;
+}
+
+extern "C" void ds4_gpu_decode_graph_abort(
+        const ds4_decode_graph_key *key) {
+    if (!g_rocm_decode_graph_capturing) return;
+    g_rocm_decode_graph_capturing = 0;
+    hipGraph_t graph = NULL;
+    (void)hipStreamEndCapture(cuda_decode_stream(), &graph);
+    if (graph) (void)hipGraphDestroy(graph);
+    (void)hipGetLastError();
+    rocm_decode_graph_entry_retire(rocm_decode_graph_find(key));
+}
+
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
+    (void)hipDeviceSynchronize();
+    for (uint32_t il = 0; il < DS4_ROCM_DECODE_GRAPH_LAYERS; il++) {
+        for (uint32_t island = 0;
+             island < DS4_ROCM_DECODE_GRAPH_ISLANDS;
+             island++) {
+            for (uint32_t v = 0; v < DS4_ROCM_DECODE_GRAPH_VARIANTS; v++) {
+                ds4_rocm_decode_graph_entry *entry =
+                    &g_rocm_decode_graphs[il][island][v];
+                if (entry->exec) (void)hipGraphExecDestroy(entry->exec);
+                memset(entry, 0, sizeof(*entry));
+            }
+        }
+    }
+    if (getenv("DS4_ROCM_DECODE_GRAPH_LOG") &&
+        (g_rocm_decode_graph_captures || g_rocm_decode_graph_replays)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "decode graph summary captures=%llu "
+                "replays=%llu\n",
+                (unsigned long long)g_rocm_decode_graph_captures,
+                (unsigned long long)g_rocm_decode_graph_replays);
+    }
+    g_rocm_decode_graph_capturing = 0;
+    g_rocm_decode_graph_captures = 0;
+    g_rocm_decode_graph_replays = 0;
+}
+#else
+extern "C" int ds4_gpu_decode_graphs_supported(void) { return 0; }
+extern "C" int ds4_gpu_decode_graph_begin(
+        const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" int ds4_gpu_decode_graph_end(
+        const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" void ds4_gpu_decode_graph_abort(
+        const ds4_decode_graph_key *key) { (void)key; }
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
+#endif
+
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     if (!event_value) return 0;
     *event_value = 0;
@@ -6152,7 +6393,8 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
             return 0;
         }
     }
-    cudaError_t err = cudaEventRecord(g_selected_readback_event, 0);
+    cudaError_t err = cudaEventRecord(g_selected_readback_event,
+                                      cuda_decode_stream());
     if (err != cudaSuccess) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "selected readback event record failed: %s\n",

@@ -59,6 +59,13 @@ typedef struct {
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
+#define DS4_DEVICE_NAME_MAX 96
+
+typedef struct {
+    char name[DS4_DEVICE_NAME_MAX];
+    uint64_t memory_bytes;
+} ds4_device_info;
+
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*ds4_session_cancel_fn)(void *ud);
 
@@ -225,6 +232,9 @@ uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
+/* Returns accelerator identity for diagnostics. CPU and unsupported backends
+ * return a stable backend label with memory_bytes set to zero. */
+int ds4_engine_device_info(ds4_engine *e, ds4_device_info *out);
 int ds4_engine_layer_count(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
@@ -417,6 +427,37 @@ void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+
+#define DS4_DIST_METRICS_MAX_STAGES 64
+
+typedef struct {
+    uint32_t layer_start;
+    uint32_t layer_end;
+    char device_name[DS4_DEVICE_NAME_MAX];
+    uint64_t device_memory_bytes;
+    uint64_t calls;
+    uint64_t tokens;
+    uint64_t eval_usec;
+    uint64_t downstream_wait_usec;
+    uint64_t forward_send_usec;
+    uint64_t input_bytes;
+    uint64_t output_bytes;
+    uint32_t last_tokens;
+    uint32_t last_eval_usec;
+    uint32_t last_downstream_wait_usec;
+    uint32_t last_forward_send_usec;
+} ds4_dist_stage_metrics;
+
+typedef struct {
+    uint32_t stage_count;
+    ds4_dist_stage_metrics stages[DS4_DIST_METRICS_MAX_STAGES];
+} ds4_distributed_metrics;
+
+/* Monitoring snapshot. Distributed wait values include downstream work and
+ * therefore overlap with later stages; consumers must not add them to eval
+ * times when calculating critical-path percentages. */
+int ds4_session_distributed_metrics(ds4_session *s,
+                                    ds4_distributed_metrics *out);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
@@ -438,6 +479,34 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen);
+/* Distributed speculative-decode helpers. A speculative block snapshots only
+ * the compressor/indexer frontiers owned by this slice; raw KV rows are a
+ * position-addressed ring and are overwritten by a partial-accept replay. */
+int ds4_session_layer_slice_spec_begin(ds4_session *s,
+                                       uint32_t layer_start,
+                                       uint32_t layer_end,
+                                       char *err,
+                                       size_t errlen);
+int ds4_session_layer_slice_spec_rollback(ds4_session *s,
+                                          char *err,
+                                          size_t errlen);
+void ds4_session_layer_slice_spec_commit(ds4_session *s);
+/* Compute target top-1 values for rows [0,n_tokens-2] and return the full
+ * logits of the last row. Call immediately after a batched final-layer slice. */
+int ds4_session_layer_slice_verify_tops(ds4_session *s,
+                                        uint32_t n_tokens,
+                                        int *row_tops,
+                                        float *last_logits,
+                                        char *err,
+                                        size_t errlen);
+/* Build a DSpark proposal from the target-hidden capture produced by the last
+ * layer-slice evaluation. Returns zero when this worker has no DSpark support. */
+int ds4_session_layer_slice_dspark_propose(ds4_session *s,
+                                           int token,
+                                           int *drafts,
+                                           int drafts_cap,
+                                           char *err,
+                                           size_t errlen);
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
                                          uint32_t n_tokens,

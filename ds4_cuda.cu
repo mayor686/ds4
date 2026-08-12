@@ -1254,6 +1254,22 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     return out;
 }
 
+extern "C" int ds4_gpu_device_info(int logical_tier, char *name,
+                                      size_t name_cap,
+                                      uint64_t *memory_bytes) {
+    if (name_cap) name[0] = '\0';
+    if (memory_bytes) *memory_bytes = 0;
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop,
+                                g_gpu[logical_tier].device_id) != cudaSuccess) {
+        return 0;
+    }
+    if (name_cap) snprintf(name, name_cap, "%s", prop.name);
+    if (memory_bytes) *memory_bytes = (uint64_t)prop.totalGlobalMem;
+    return 1;
+}
+
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
     if (!map || size == 0 || bias == 0) return 0;
     g_support_host_base = map;
