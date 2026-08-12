@@ -863,3 +863,99 @@ Risultati:
 - 64K/700K, window 6: `.ds4-benchmarks/gfx906-0731/20260812-093818-long64k-700`;
 - logits configurazione finale, bit-identici alla prima prova del nuovo split:
   `.ds4-benchmarks/gfx906-0731/20260812-094742-logits-f32`.
+
+## Valutazione TP/EP multiprocesso del 12 agosto 2026
+
+Questa prova risponde alla domanda se convenga sostituire il PP6 con tensor
+parallelism (TP), oppure accoppiare le GPU in expert parallelism (EP). RCCL
+2.27.7 non è stato usato: il primo `all-reduce` termina in errore anche con il
+test ufficiale `rccl-tests`, con `iommu=pt` attivo e anche escludendo la GPU da
+32 GiB. È stato quindi realizzato un collettivo HIP IPC a stella, coerente con
+l'architettura DS4 a un processo per GPU.
+
+Il trasporto è corretto su tutte e sei le gfx906. La prova a sei processi ha
+verificato 8 MiB per rank senza errori; pertanto la Radeon da 32 GiB non è
+incompatibile con le altre GPU e non serve modificarne il VBIOS. Per un buffer
+FP32 da 28 KiB, rappresentativo di un'attivazione da 7.168 elementi, sono stati
+misurati:
+
+| Topologia HIP IPC | Latenza accodata | Latenza sincronizzata | Esito |
+|---|---:|---:|---:|
+| 5 GPU da 16 GiB | 3,80 us | 41,75 us | PASS |
+| tutte le 6 GPU | 4,05 us | 55,32 us | PASS |
+
+La latenza accodata misura il lancio del kernel; quella sincronizzata include
+le dipendenze peer e rappresenta il costo osservato dal token successivo.
+
+### TP sui blocchi Q8
+
+È stato aggiunto un kernel Q8 con partizione della dimensione K e riduzione
+FP32. Il gate numerico a sei shard 7.168→4.096 ha RMS `1,16e-5` e massimo
+assoluto `2,10e-5` rispetto alla proiezione non partizionata. La sola parte di
+calcolo può scalare idealmente di 5,55x su una GPU, ma nei blocchi reali di
+Flash-0731 la proiezione è troppo breve perché il risparmio compensi
+l'all-reduce.
+
+| Blocco reale, TP2 | GPU 0–1 | GPU 2–3 | GPU 4–5 |
+|---|---:|---:|---:|
+| Attention output Q8, 8.192→4.096 | 0,92x | 0,90x | 0,89x |
+| Shared expert Q8 completo | 0,78x | 0,84x | 0,51x |
+
+Un valore inferiore a 1,00x è una regressione. Il test dello shared expert
+include gate e up 4.096→2.048, SwiGLU, down 2.048→4.096 e un unico all-reduce
+finale. I risultati sono quindi più favorevoli al TP rispetto a una riduzione
+dopo ogni proiezione, ma restano negativi su tutte le coppie.
+
+Il TP5 non può inoltre conservare il modello e una KV cache da 700K nelle sole
+cinque schede da 16 GiB: 80 GiB aggregati sono inferiori ai circa 86,7 GiB dei
+pesi, prima ancora di contare cache e buffer. Servirebbero tutte e sei le GPU,
+ma il TP6 misurato aggiunge ulteriore latenza.
+
+### EP sui routed expert IQ2/Q2
+
+La prova EP usa le dimensioni e i formati effettivi di Flash-0731: input
+4.096, intermedio 2.048, output 4.096, gate/up IQ2_XXS, down Q2_K e sei expert
+attivi. Ogni GPU della coppia possiede tre expert, poi viene eseguita una sola
+riduzione FP32. Gli slot non posseduti ora vengono azzerati prima della lettura
+dei pesi, invece di calcolare inutilmente l'expert 0.
+
+| Routed MoE decode, EP2 | GPU 0–1 | GPU 2–3 | GPU 4–5 |
+|---|---:|---:|---:|
+| Tempo completo | 0,3206 ms | 0,3169 ms | 0,3188 ms |
+| Tempo EP2 | 0,2689 ms | 0,2774 ms | 0,3318 ms |
+| Accelerazione | **1,19x** | **1,14x** | 0,96x |
+
+L'output EP è identico al riferimento nella prova sintetica (RMS e massimo
+assoluto pari a zero). Il guadagno resta però confinato al routed MoE. Dal
+profilo del modello questa fase pesa circa il 22% del tempo di un layer; anche
+applicando 1,19x alla coppia migliore, il limite di Amdahl è circa +3,6% sul
+layer. La terza coppia è regressiva e passare da PP6 a tre stadi PP con EP2
+ridurrebbe anche il parallelismo del prefill. Il beneficio end-to-end previsto
+è quindi 0–4%, entro la variabilità del sistema, non un miglioramento
+significativo.
+
+### Decisione
+
+Il PP6 `7/7/7/7/7/8`, finestra 6, resta il percorso di produzione. Il
+collettivo e i test TP/EP vengono conservati su un branch sperimentale come
+gate riproducibile, ma non vengono collegati al grafo del server e non cambiano
+`run-speed.sh` o la pull request gfx906. Una futura integrazione sarà sensata
+solo se un kernel fuso o una topologia diversa supera questi gate end-to-end,
+in particolare `>1,10x` includendo trasporto e sincronizzazione.
+
+I test aggiunti sono:
+
+- `tests/rocm_tp_ipc_star`: collettivo multiprocesso e verifica peer;
+- `tests/rocm_tp_q8_projection`: correttezza della partizione K Q8;
+- `tests/rocm_tp_q8_ipc_e2e`: shared expert Q8 end-to-end;
+- `tests/rocm_ep_iq2_q2_ipc_e2e`: routed MoE IQ2/Q2 end-to-end.
+
+Esempi di esecuzione:
+
+```bash
+make tests/rocm_tp_ipc_star tests/rocm_tp_q8_ipc_e2e \
+  tests/rocm_ep_iq2_q2_ipc_e2e ROCM_ARCH=gfx906
+./tests/rocm_tp_ipc_star --devices 0,1,3,4,5
+./tests/rocm_tp_q8_ipc_e2e --devices 0,1
+./tests/rocm_ep_iq2_q2_ipc_e2e --devices 0,1
+```

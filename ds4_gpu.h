@@ -342,7 +342,9 @@ void ds4_gpu_model_residency_skip(int skip);
 /* Nonzero after any gate exchange failed; the eval must abort. */
 int ds4_gpu_tp_failed(void);
 
-/* Tensor-parallel sliced projections (Metal decode path only).
+/* Tensor-parallel sliced projections. Metal and CUDA provide the full graph
+ * path; ROCm currently provides the Q8_0 K-slice primitives used by its
+ * process-per-GPU performance gates.
  *
  * ds4_gpu_matmul_q8_0_kslice_tensor computes a k-range partial matvec:
  * out[out_dim] = W[:, k_off : k_off + k_cnt] @ x[x_elem_off : +k_cnt] where
@@ -365,8 +367,8 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off);
-/* CUDA multi-row variant. Each input row contains only the owned contiguous
- * K slice, while each output row spans the full projection width. */
+/* Multi-row GPU variant. Each input row contains only the owned contiguous K
+ * slice, while each output row spans the full projection width. */
 int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

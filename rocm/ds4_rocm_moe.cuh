@@ -927,7 +927,21 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     if ((active_mask & (1u << slot)) == 0) return;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        if (lane == 0) {
+            for (uint32_t rr = 0; rr < 4u; rr++) {
+                const uint32_t row =
+                    blockIdx.x * 128u + row_lane + rr * 32u;
+                if (row >= expert_mid_dim) continue;
+                const uint64_t off =
+                    (uint64_t)pair * expert_mid_dim + row;
+                gate_out[off] = 0.0f;
+                up_out[off] = 0.0f;
+                mid_out[off] = 0.0f;
+            }
+        }
+        return;
+    }
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
@@ -1094,7 +1108,23 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     if ((active_mask & (1u << slot)) == 0) return;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        if (lane == 0) {
+            for (uint32_t rr = 0; rr < 4u; rr++) {
+                const uint32_t row =
+                    blockIdx.x * 128u + row_lane + rr * 32u;
+                if (row >= expert_mid_dim) continue;
+                const uint64_t off =
+                    (uint64_t)pair * expert_mid_dim + row;
+                if (write_aux) {
+                    gate_out[off] = 0.0f;
+                    up_out[off] = 0.0f;
+                }
+                mid_out[off] = 0.0f;
+            }
+        }
+        return;
+    }
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
@@ -2158,7 +2188,10 @@ __global__ static void moe_down_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = 0.0f;
+        return;
+    }
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;

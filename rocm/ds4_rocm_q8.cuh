@@ -151,6 +151,45 @@ __global__ static void matmul_q8_0_preq_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+/* Contiguous K-slice projection used by process-per-GPU tensor parallelism.
+ * Each rank quantizes only its local activation slice, reads the matching
+ * Q8_0 blocks from every output row, and emits a full-width FP32 partial.
+ * The partials are summed before the residual connection. */
+__global__ static void matmul_q8_0_kslice_preq_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t slice_dim,
+        uint64_t out_dim,
+        uint64_t full_blocks,
+        uint64_t block_start,
+        uint64_t slice_blocks,
+        int use_dp4a) {
+    const uint64_t row =
+        (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    out += tok * out_dim;
+    xq += tok * slice_blocks * 32u;
+    xscale += tok * slice_blocks;
+    const unsigned char *wr =
+        w + row * full_blocks * 34u + block_start * 34u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < slice_blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = slice_dim - i0 < 32u ? slice_dim - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34u);
+        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+        const int8_t *xqb = xq + b * 32u;
+        const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 __global__ static void matmul_q8_0_preq_warp8_kernel(
         float *out,
         const unsigned char *w,

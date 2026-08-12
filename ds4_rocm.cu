@@ -183,11 +183,95 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
         uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint64_t x_elem_off) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
-    (void)x_elem_off;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
+    if (!x || x_elem_off > x->bytes / sizeof(float) ||
+        k_cnt > x->bytes / sizeof(float) - x_elem_off) {
+        return 0;
+    }
+    ds4_gpu_tensor x_slice = *x;
+    x_slice.ptr = (char *)x->ptr + x_elem_off * sizeof(float);
+    x_slice.bytes = k_cnt * sizeof(float);
+    x_slice.owner = 0;
+    return ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            out, model_map, model_size, weight_offset,
+            full_in_dim, out_dim, k_off, k_cnt, &x_slice, 1u);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t in_start,
+        uint64_t in_count,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 ||
+        in_count == 0 || n_tok == 0 || n_tok > 65535u) return 0;
+    if ((in_start % 32u) != 0 || (in_count % 32u) != 0 ||
+        in_start > in_dim || in_count > in_dim - in_start) return 0;
+    const uint64_t full_blocks = (in_dim + 31u) / 32u;
+    const uint64_t block_start = in_start / 32u;
+    const uint64_t slice_blocks = in_count / 32u;
+    if (weight_offset > model_size || full_blocks > UINT64_MAX / 34u ||
+        out_dim > UINT64_MAX / (full_blocks * 34u) ||
+        in_count > UINT64_MAX / n_tok || out_dim > UINT64_MAX / n_tok) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * full_blocks * 34u;
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < n_tok * in_count * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
+                                             weight_bytes, "q8_0_kslice");
+    if (!wptr) return 0;
+
+    const uint64_t xq_bytes = n_tok * slice_blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + n_tok * slice_blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 kslice prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const dim3 qgrid((unsigned)slice_blocks, (unsigned)n_tok, 1u);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "matmul_q8_0_kslice quantize launch")) return 0;
+    const dim3 grid(((unsigned)out_dim + 7u) / 8u,
+                    (unsigned)n_tok, 1u);
+    matmul_q8_0_kslice_preq_warp8_kernel<<<grid, 256>>>(
+            (float *)out->ptr,
+            (const unsigned char *)wptr,
+            xq,
+            xscale,
+            in_count,
+            out_dim,
+            full_blocks,
+            block_start,
+            slice_blocks,
+            1);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice launch");
+}
+
+extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint32_t weight_type,
+        uint64_t full_in_dim,
+        uint64_t k_off,
+        uint64_t k_cnt,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t x_elem_off) {
+    if (weight_type != 8u) return 0;
+    return ds4_gpu_matmul_q8_0_kslice_tensor(
+            out, model_map, model_size, weight_offset,
+            full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
 }
 
 extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
