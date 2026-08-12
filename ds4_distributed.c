@@ -8772,6 +8772,8 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator max end-to-end prefill chunks in flight. Default: workers+2, capped at 8.\n"
         "  --dist-activation-bits N\n"
         "      Coordinator hidden-state transport width: 32, 16, or 8. Default: 32.\n"
+        "  --dist-require-worker-output\n"
+        "      Do not load a coordinator output-head fallback; require it on the final worker.\n"
         "  --dist-replay-check\n"
         "      Coordinator diagnostic: reset and replay the prompt, then compare logits.\n"
         "  --debug\n"
@@ -8896,6 +8898,14 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         opt->activation_bits = bits;
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--dist-require-worker-output")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->require_worker_output = true;
+        return DS4_DIST_CLI_MATCHED;
+    }
     if (!strcmp(arg, "--dist-replay-check")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -8925,7 +8935,7 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
-            opt->activation_bits != 0) {
+            opt->activation_bits != 0 || opt->require_worker_output) {
             if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
             return 1;
         }
@@ -8972,6 +8982,10 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         }
         if (opt->activation_bits != 0) {
             if (errlen) snprintf(err, errlen, "--dist-activation-bits requires --role coordinator");
+            return 1;
+        }
+        if (opt->require_worker_output) {
+            if (errlen) snprintf(err, errlen, "--dist-require-worker-output requires --role coordinator");
             return 1;
         }
         return 0;

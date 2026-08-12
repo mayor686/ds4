@@ -5,6 +5,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Ignore an inherited speed-profile route: this example deliberately uses its
+# explicit conservative split for the SSD capacity tier.
+unset PIPELINE_DEVICES PIPELINE_LAYER_COUNTS
+
 export MODEL_PATH="/home/mayor86/llama/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 export CTX=1000000
 export MAX_TOKENS=1000000

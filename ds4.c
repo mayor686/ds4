@@ -57516,7 +57516,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
          * last worker advertises N:M rather than N:output. Bind it when the
          * local GGUF contains it, without requiring split GGUFs to do so. */
         load_output_optional =
-            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+            !opt->distributed.require_worker_output;
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);

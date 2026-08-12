@@ -330,7 +330,7 @@ the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 The six-gfx906 PP6 example includes two self-contained profiles. Edit
 `MODEL_PATH` inside the selected file and run it directly; no launch-time
 environment variables are required. The speed profile uses a measured
-6 + 7x4 + 9/output layer split at 700K context, while the capacity profile keeps the
+7x5 + 8/output layer split at 700K context, while the capacity profile keeps the
 conservative 13 + 6x5 split needed by its larger KV cache:
 
 ```sh
@@ -348,11 +348,21 @@ compatibility shim is slower even though the shim remains useful for numerical
 regression tests. `DS4_ROCM_ENABLE_EMULATED_MOE_WMMA=1` restores that legacy
 path for diagnostics; native rocWMMA architectures are unaffected.
 
-`run.sh` itself is not tied to that machine: `COORD_DEVICE`, `COORD_LAYERS`,
-and the space-separated `WORKER_SPECS` (`DEVICE,START:END`, with
-`DEVICE,START:output` for the final worker) describe an arbitrary distributed
-gfx906 route. The two profile files are concrete
+`run.sh` itself is not tied to that machine. `PIPELINE_DEVICES` lists devices
+in layer order, using either ROCR indexes or stable PCI references such as
+`pci:0000:43:00.0`; `PIPELINE_LAYER_COUNTS` assigns the corresponding number
+of layers and must total 43. The last device automatically owns the output
+head. The explicit `COORD_DEVICE`, `COORD_LAYERS`, and `WORKER_SPECS` form
+remains available for unusual routes. The two profile files are concrete
 six-GPU examples whose settings can be edited in place.
+
+When the final worker owns `START:output`, the launcher also passes
+`--dist-require-worker-output`. This avoids keeping a redundant output-head
+fallback on the coordinator and can recover about 0.5 GiB on a 16 GiB card.
+Coordinators started manually retain the backward-compatible local fallback
+unless this option is specified. Set `DIST_REQUIRE_WORKER_OUTPUT=0` only for a
+custom route that deliberately returns the final hidden state to the
+coordinator.
 
 ### Practical SSD streaming examples
 

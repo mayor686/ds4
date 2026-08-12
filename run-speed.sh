@@ -6,15 +6,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export MODEL_PATH="/home/mayor86/llama/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
-# The coordinator runs on a 16 GiB Pro VII. Four seven-layer workers use the
-# other 16 GiB cards, while the 32 GiB device owns the final nine layers and
-# output head. This preserves the validated activation boundaries and keeps a
-# 700K FP32 KV cache resident without SSD streaming. A 256-token chunk is the
-# measured long-prefill choice; keep output budget and context separate.
+# The coordinator and four workers each own seven layers; the 32 GiB final GPU
+# owns eight layers plus the output head.  PCI references remain stable when
+# ROCr renumbers devices after a reboot.  On another six-gfx906 host, edit only
+# this ordered device list: put the largest-VRAM card last.
 export CTX=700000
 export MAX_TOKENS=32768
 export PREFILL_CHUNK=256
-export DIST_WINDOW=5
+export DIST_WINDOW=6
+export DIST_ACTIVATION_BITS=16
 export WORKER_START_DELAY=5
 export HTTP_HOST=0.0.0.0
 export HTTP_PORT=8080
@@ -31,8 +31,7 @@ export SSD_STREAMING=0
 export SSD_STREAMING_CACHE_EXPERTS=
 export SSD_STREAMING_PRELOAD_EXPERTS=
 export SSD_STREAMING_COLD=0
-export COORD_DEVICE=3
-export COORD_LAYERS=0:5
-export WORKER_SPECS="0,6:12 1,13:19 4,20:26 5,27:33 2,34:output"
+export PIPELINE_DEVICES="pci:0000:46:00.0 pci:0000:63:00.0 pci:0000:66:00.0 pci:0000:30:00.0 pci:0000:03:00.0 pci:0000:43:00.0"
+export PIPELINE_LAYER_COUNTS="7 7 7 7 7 8"
 
 exec "${SCRIPT_DIR}/run.sh"

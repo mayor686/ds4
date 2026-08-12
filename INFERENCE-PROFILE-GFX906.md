@@ -809,3 +809,57 @@ restano inattive e non possono peggiorare il percorso residente normale.
   `.ds4-benchmarks/gfx906-0731/20260811-091724-moe-iq2-rows8`,
   `.ds4-benchmarks/gfx906-0731/20260811-092152-decode-f32` e
   `.ds4-benchmarks/gfx906-0731/20260811-092259-decode-f32`.
+
+## Aggiornamento 12 agosto 2026: bilanciamento dopo il dissipatore
+
+Dopo la sostituzione del dissipatore, il profilo FP32 da 700K completa una
+frontiera effettiva da 65.536 token senza throttling critico. Il nuovo split
+assegna `7/7/7/7/7/8` layer ai sei stadi e porta la finestra distribuita da 5 a
+6, affinché possa essere presente almeno un chunk per stadio. La GPU da 32 GiB
+resta finale e possiede gli ultimi otto layer e l'output head.
+
+| Frontiera | Vecchio split, window 5 | Nuovo split, window 6 | Variazione |
+|---|---:|---:|---:|
+| Prefill 16K | 175,88 token/s | 203,64 token/s | **+15,78%** |
+| Decode 16K | 9,93 token/s | 9,95 token/s | +0,20% |
+| Prefill 64K, ctx 700K | 156,89 token/s | 183,30 token/s | **+16,83%** |
+| Decode 64K, ctx 700K | 8,88 token/s | 8,91 token/s | +0,34% |
+
+Lo split da solo rende uniformi i tempi dei sei stadi ma non aumenta il
+throughput: con window 5 il limite a regime diventa la somma dei tempi divisa
+per cinque. A 16K misurava infatti 175,81 token/s. Window 6 elimina questo
+limite e realizza il guadagno del bilanciamento.
+
+Il settimo layer portava inizialmente il coordinatore a 16,01 GiB pianificati
+su una GPU da 15,98 GiB. La route già terminava su un worker `START:output`, ma
+il coordinatore conservava comunque circa 0,52 GiB di output head come
+fallback. L'opzione generale `--dist-require-worker-output` evita questa copia
+solo quando il launcher sa che il worker finale possiede l'head; il
+comportamento preesistente resta il default per le invocazioni manuali. Con la
+copia rimossa, il profilo 700K completa inizializzazione e benchmark.
+
+I launcher possono ora descrivere topologie simili con una lista ordinata di
+device e conteggi di layer. I device accettano indirizzi PCI stabili, risolti a
+runtime tramite `rocminfo`, così un riavvio che modifica gli indici ROCr non
+cambia l'assegnazione fisica. Il profilo concreto usa:
+
+```text
+PIPELINE_LAYER_COUNTS="7 7 7 7 7 8"
+```
+
+Gate numerico sul prompt da 2.697 token: tutti i logits sono finiti, argmax
+invariato e overlap top-20 19/20 rispetto al precedente split. Rispetto al
+percorso `--quality`, il nuovo split FP16 risulta più vicino del precedente
+(`RMS 0,487` contro `0,799`) e conserva lo stesso argmax. La continuazione
+greedy coincide per 90 token prima della normale divergenza autoregressiva
+causata dal diverso confine di trasporto. Il launcher mantiene KV-cache FP32 e
+attivazioni inter-stadio FP16; portare soltanto il trasporto a FP32 non migliora
+il confronto numerico.
+
+Risultati:
+
+- 16K, window 5: `.ds4-benchmarks/gfx906-0731/20260812-092908-long16k-f32`;
+- 16K, window 6: `.ds4-benchmarks/gfx906-0731/20260812-093213-long16k-f32`;
+- 64K/700K, window 6: `.ds4-benchmarks/gfx906-0731/20260812-093818-long64k-700`;
+- logits configurazione finale, bit-identici alla prima prova del nuovo split:
+  `.ds4-benchmarks/gfx906-0731/20260812-094742-logits-f32`.

@@ -56,21 +56,22 @@ CTX_ALLOC=300000
 FRONTIER=8192
 GEN_TOKENS=256
 PREFILL_CHUNK=64
-DIST_WINDOW=5
-ACTIVATION_BITS=16
+DIST_WINDOW="${DIST_WINDOW:-6}"
+ACTIVATION_BITS="${ACTIVATION_BITS:-16}"
 DSPARK_CONFIDENCE=0.9
 PROFILE_LAYER=
 RUNTIME_ENV=()
 BENCH_EXTRA_ARGS=()
 
 # ROCR indexes on the validation host. The coordinator is a 16 GiB Pro VII;
-# device 2 is the 32 GiB card and owns layers 34:42 plus the output head.
-# This is also the resident FP32 700K production split.
+# device 2 is the 32 GiB card and owns layers 35:42 plus the output head.
+# This is also the resident FP32 700K production split; window 6 keeps one
+# prefill chunk available for each of the six balanced stages.
 COORD_DEVICE=3
-COORD_LAYERS=0:5
+COORD_LAYERS=0:6
 FINAL_DEVICE=2
-FINAL_LAYERS=34:output
-WORKER_SPECS=("0 6:12" "1 13:19" "4 20:26" "5 27:33")
+FINAL_LAYERS=35:output
+WORKER_SPECS=("0 7:13" "1 14:20" "4 21:27" "5 28:34")
 
 MODE="${1:-all}"
 case "${MODE}" in
@@ -91,11 +92,11 @@ case "${MODE}" in
         PREFILL_CHUNK=256
         ;;
     swap14)
-        WORKER_SPECS=("0 6:12" "4 13:19" "1 20:26" "5 27:33")
+        WORKER_SPECS=("0 7:13" "4 14:20" "1 21:27" "5 28:34")
         ;;
     optimized)
         PREFILL_CHUNK=256
-        WORKER_SPECS=("0 6:12" "4 13:19" "1 20:26" "5 27:33")
+        WORKER_SPECS=("0 7:13" "4 14:20" "1 21:27" "5 28:34")
         ;;
     window3|window6|window8)
         PREFILL_CHUNK=256
@@ -363,6 +364,7 @@ run_case() {
         --dist-prefill-chunk "${PREFILL_CHUNK}" \
         --dist-prefill-window "${DIST_WINDOW}" \
         --dist-activation-bits "${ACTIVATION_BITS}" \
+        --dist-require-worker-output \
         "${BENCH_EXTRA_ARGS[@]}" \
         "${bench_args[@]}" \
         >"${OUT}/${case_name}.stdout" 2>"${OUT}/${case_name}.log" || bench_status=$?
@@ -424,7 +426,8 @@ run_logits_case() {
         --listen 127.0.0.1 "${port}" \
         --dist-prefill-chunk "${PREFILL_CHUNK}" \
         --dist-prefill-window "${DIST_WINDOW}" \
-        --dist-activation-bits "${ACTIVATION_BITS}" "${quality_args[@]}" \
+        --dist-activation-bits "${ACTIVATION_BITS}" \
+        --dist-require-worker-output "${quality_args[@]}" \
         >"${OUT}/${case_name}.stdout" 2>"${OUT}/${case_name}.log"
     sleep 2
     cleanup

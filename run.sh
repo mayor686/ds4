@@ -62,6 +62,8 @@ CTX="${CTX:-28672}"                       # tested safe ceiling with the GUI act
 MAX_TOKENS="${MAX_TOKENS:-${CTX}}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-64}"      # small chunks keep all 6 cards busy
 DIST_WINDOW="${DIST_WINDOW:-5}"           # larger windows can OOM 16 GB workers
+DIST_ACTIVATION_BITS="${DIST_ACTIVATION_BITS:-16}"
+DIST_REQUIRE_WORKER_OUTPUT="${DIST_REQUIRE_WORKER_OUTPUT:-auto}"
 WORKER_START_DELAY="${WORKER_START_DELAY:-20}"
 DS4_PROFILE="${DS4_PROFILE:-0}"
 DS4_COORD_SERIALIZE="${DS4_COORD_SERIALIZE:-0}"
@@ -69,6 +71,7 @@ DS4_ROCM_ATTN_COMP_CACHE_F16="${DS4_ROCM_ATTN_COMP_CACHE_F16:-0}"
 ROCPROF_COORD_OUTPUT_DIR="${ROCPROF_COORD_OUTPUT_DIR:-}"
 ROCPROF_WORKER_DEVICE="${ROCPROF_WORKER_DEVICE:-}"
 ROCPROF_WORKER_OUTPUT_DIR="${ROCPROF_WORKER_OUTPUT_DIR:-}"
+DS4_LAUNCH_DRY_RUN="${DS4_LAUNCH_DRY_RUN:-0}"
 TRACE_FILE="${TRACE_FILE:-}"
 TRACE_ARGS=()
 if [ -n "${TRACE_FILE}" ]; then
@@ -102,6 +105,13 @@ if [ "${DS4_ROCM_ATTN_COMP_CACHE_F16}" != "0" ] &&
     echo "run.sh: DS4_ROCM_ATTN_COMP_CACHE_F16 must be 0 (F32) or 1 (experimental compact cache)" >&2
     exit 1
 fi
+case "${DIST_ACTIVATION_BITS}" in
+    8|16|32) ;;
+    *)
+        echo "run.sh: DIST_ACTIVATION_BITS must be 8, 16, or 32" >&2
+        exit 1
+        ;;
+esac
 
 # --- HTTP API ---
 HTTP_HOST="${HTTP_HOST:-0.0.0.0}"
@@ -122,18 +132,183 @@ MTP_DRAFT="${MTP_DRAFT:-2}"
 MTP_ARGS=()
 
 # --- layer split: all 43 layers (0..42), final worker owns output head ---
-# The context profile keeps the conservative 13 + 6x5 split.  The speed
-# profile uses 8 + 7x5 at a smaller context: equal-size GPU stages remove the
-# coordinator prefill bottleneck while still fitting the 16GB workers.
+# PIPELINE_DEVICES and PIPELINE_LAYER_COUNTS are the portable form.  Device
+# references may be ROCR indexes or stable PCI addresses such as
+# pci:0000:43:00.0.  The explicit COORD_*/WORKER_SPECS form remains supported
+# for existing launchers and unusual routes.
 #
 # A worker spec is DEVICE,LAYER_START:LAYER_END; use LAYER_START:output for
 # the final worker so it also owns the output head.  Keeping the route in data
 # instead of hard-coding five workers makes this shared launcher usable for
 # other gfx906 counts and memory layouts.  The two example profiles below set
 # the exact six-GPU maps validated on the development machine.
+MODEL_LAYER_COUNT="${MODEL_LAYER_COUNT:-43}"
+PIPELINE_DEVICES="${PIPELINE_DEVICES:-}"
+PIPELINE_LAYER_COUNTS="${PIPELINE_LAYER_COUNTS:-}"
 COORD_DEVICE="${COORD_DEVICE:-2}"
 COORD_LAYERS="${COORD_LAYERS:-0:12}"
 WORKER_SPECS="${WORKER_SPECS:-0,13:18 1,19:24 3,25:30 4,31:36 5,37:output}"
+
+configure_pipeline_from_counts() {
+    local i count start=0 end
+    local -a devices counts specs=()
+
+    if [ -z "${PIPELINE_DEVICES}" ] && [ -z "${PIPELINE_LAYER_COUNTS}" ]; then
+        return
+    fi
+    if [ -z "${PIPELINE_DEVICES}" ] || [ -z "${PIPELINE_LAYER_COUNTS}" ]; then
+        echo "run.sh: set both PIPELINE_DEVICES and PIPELINE_LAYER_COUNTS" >&2
+        exit 1
+    fi
+
+    read -r -a devices <<< "${PIPELINE_DEVICES}"
+    read -r -a counts <<< "${PIPELINE_LAYER_COUNTS}"
+    if [ "${#devices[@]}" -lt 2 ] || [ "${#devices[@]}" -ne "${#counts[@]}" ]; then
+        echo "run.sh: pipeline device and layer-count lists must have the same length (at least two)" >&2
+        exit 1
+    fi
+
+    for i in "${!counts[@]}"; do
+        count="${counts[i]}"
+        if [[ ! "${count}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "run.sh: invalid pipeline layer count '${count}'" >&2
+            exit 1
+        fi
+        end=$((start + count - 1))
+        if [ "${i}" -eq 0 ]; then
+            COORD_DEVICE="${devices[i]}"
+            COORD_LAYERS="0:${end}"
+        elif [ "${i}" -eq $((${#counts[@]} - 1)) ]; then
+            specs+=("${devices[i]},${start}:output")
+        else
+            specs+=("${devices[i]},${start}:${end}")
+        fi
+        start=$((end + 1))
+    done
+    if [ "${start}" -ne "${MODEL_LAYER_COUNT}" ]; then
+        echo "run.sh: pipeline counts cover ${start} layers, model requires ${MODEL_LAYER_COUNT}" >&2
+        exit 1
+    fi
+    WORKER_SPECS="${specs[*]}"
+}
+
+ROCR_INVENTORY_LOADED=0
+ROCR_BDFIDS=()
+
+load_rocr_inventory() {
+    if [ "${ROCR_INVENTORY_LOADED}" != "0" ]; then
+        return
+    fi
+    if ! command -v rocminfo >/dev/null 2>&1; then
+        echo "run.sh: rocminfo is required when using pci: device references" >&2
+        exit 1
+    fi
+    mapfile -t ROCR_BDFIDS < <(
+        env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES -u GPU_DEVICE_ORDINAL \
+            rocminfo 2>/dev/null |
+        awk '
+            /^[[:space:]]*Device Type:[[:space:]]*GPU[[:space:]]*$/ { gpu = 1; next }
+            gpu && /^[[:space:]]*BDFID:/ { print $2; gpu = 0 }
+        '
+    )
+    if [ "${#ROCR_BDFIDS[@]}" -eq 0 ]; then
+        echo "run.sh: rocminfo did not report any GPU BDF identifiers" >&2
+        exit 1
+    fi
+    ROCR_INVENTORY_LOADED=1
+}
+
+resolve_device_ref() { # <ROCR index | pci:DOMAIN:BUS:DEVICE.FUNCTION>
+    local ref="$1" domain bus slot function bdf i
+    if [[ "${ref}" =~ ^[0-9]+$ ]]; then
+        RESOLVED_DEVICE="${ref}"
+        return
+    fi
+    if [[ ! "${ref}" =~ ^pci:(([[:xdigit:]]{4}):)?([[:xdigit:]]{2}):([[:xdigit:]]{2})\.([0-7])$ ]]; then
+        echo "run.sh: invalid device '${ref}'; use a ROCR index or pci:0000:BB:DD.F" >&2
+        exit 1
+    fi
+    domain="${BASH_REMATCH[2]:-0000}"
+    bus="${BASH_REMATCH[3]}"
+    slot="${BASH_REMATCH[4]}"
+    function="${BASH_REMATCH[5]}"
+    if [ "${domain,,}" != "0000" ]; then
+        echo "run.sh: rocminfo BDFID cannot disambiguate non-zero PCI domain ${domain}" >&2
+        exit 1
+    fi
+    bdf=$((16#${bus} * 256 + 16#${slot} * 8 + function))
+    load_rocr_inventory
+    for i in "${!ROCR_BDFIDS[@]}"; do
+        if [ "${ROCR_BDFIDS[i]}" -eq "${bdf}" ]; then
+            RESOLVED_DEVICE="${i}"
+            return
+        fi
+    done
+    echo "run.sh: PCI device '${ref}' was not found in the ROCr inventory" >&2
+    exit 1
+}
+
+resolve_route_devices() {
+    local coord_ref worker_spec worker_ref worker_layers worker_extra worker_dev
+    local -a resolved_specs=()
+    local -A used=()
+
+    coord_ref="${COORD_DEVICE}"
+    resolve_device_ref "${coord_ref}"
+    COORD_DEVICE="${RESOLVED_DEVICE}"
+    used["${COORD_DEVICE}"]="coordinator (${coord_ref})"
+
+    for worker_spec in ${WORKER_SPECS}; do
+        IFS=, read -r worker_ref worker_layers worker_extra <<< "${worker_spec}"
+        if [ -n "${worker_extra}" ]; then
+            echo "run.sh: invalid worker spec '${worker_spec}'" >&2
+            exit 1
+        fi
+        resolve_device_ref "${worker_ref}"
+        worker_dev="${RESOLVED_DEVICE}"
+        if [ -n "${used[${worker_dev}]:-}" ]; then
+            echo "run.sh: device ${worker_ref} resolves to ROCR ${worker_dev}, already used by ${used[${worker_dev}]}" >&2
+            exit 1
+        fi
+        used["${worker_dev}"]="worker ${worker_layers} (${worker_ref})"
+        resolved_specs+=("${worker_dev},${worker_layers}")
+        if [ "${worker_ref}" != "${worker_dev}" ]; then
+            echo "run.sh: resolved ${worker_ref} to ROCR device ${worker_dev}"
+        fi
+    done
+    if [ "${coord_ref}" != "${COORD_DEVICE}" ]; then
+        echo "run.sh: resolved coordinator ${coord_ref} to ROCR device ${COORD_DEVICE}"
+    fi
+    WORKER_SPECS="${resolved_specs[*]}"
+}
+
+configure_pipeline_from_counts
+resolve_route_devices
+
+case "${DIST_REQUIRE_WORKER_OUTPUT}" in
+    auto)
+        DIST_REQUIRE_WORKER_OUTPUT=0
+        for route_spec in ${WORKER_SPECS}; do
+            if [[ "${route_spec}" == *:output ]]; then
+                DIST_REQUIRE_WORKER_OUTPUT=1
+            fi
+        done
+        ;;
+    0|1) ;;
+    *)
+        echo "run.sh: DIST_REQUIRE_WORKER_OUTPUT must be auto, 0, or 1" >&2
+        exit 1
+        ;;
+esac
+
+echo "run.sh: route coordinator ROCR ${COORD_DEVICE} layers ${COORD_LAYERS}"
+for route_spec in ${WORKER_SPECS}; do
+    echo "run.sh: route worker ${route_spec%%,*} layers ${route_spec#*,}"
+done
+if [ "${DS4_LAUNCH_DRY_RUN}" != "0" ]; then
+    echo "run.sh: dry run complete"
+    exit 0
+fi
 
 WORKER_PIDS=()
 
@@ -230,6 +405,10 @@ if [ "${DS4_COORD_SERIALIZE}" != "0" ]; then
     COORD_ENV+=(AMD_SERIALIZE_KERNEL="${DS4_COORD_SERIALIZE}")
 fi
 COORD_PREFIX=()
+OUTPUT_ROUTE_ARGS=()
+if [ "${DIST_REQUIRE_WORKER_OUTPUT}" != "0" ]; then
+    OUTPUT_ROUTE_ARGS+=(--dist-require-worker-output)
+fi
 if [ -n "${ROCPROF_COORD_OUTPUT_DIR}" ]; then
     COORD_PREFIX=(rocprofv3 --kernel-trace --stats --output-format csv
         --output-directory "${ROCPROF_COORD_OUTPUT_DIR}" --)
@@ -251,6 +430,7 @@ fi
     --listen "${DIST_HOST}" "${DIST_PORT}" \
     --dist-prefill-chunk "${PREFILL_CHUNK}" \
     --dist-prefill-window "${DIST_WINDOW}" \
-    --dist-activation-bits 16 &
+    --dist-activation-bits "${DIST_ACTIVATION_BITS}" \
+    "${OUTPUT_ROUTE_ARGS[@]}" &
 COORD_PID=$!
 wait "${COORD_PID}"
