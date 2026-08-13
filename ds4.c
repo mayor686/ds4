@@ -22693,6 +22693,35 @@ static bool metal_graph_encode_decode_layer_phase(
          * Removes one dispatch per decode layer.  Either preceding fused
          * QKV path may already have performed the same work. */
         int quad_store = comp_state_already_stored ? 1 : 0;
+        bool quad_projected = quad_store > 0;
+#if defined(DS4_ROCM_BUILD)
+        if (ok && !quad_projected && ratio == 4u &&
+            !metal_graph_use_reference_compressor_pair_proj() &&
+            getenv("DS4_ROCM_DISABLE_F16_COMPRESSOR_QUAD") == NULL &&
+            layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
+            layer->indexer_compressor_kv->type == DS4_TENSOR_F16 &&
+            layer->indexer_compressor_gate->type == DS4_TENSOR_F16 &&
+            layer->indexer_compressor_kv->dim[0] == DS4_N_EMBD &&
+            layer->indexer_compressor_gate->dim[0] == DS4_N_EMBD &&
+            layer->indexer_compressor_kv->dim[1] ==
+                2u * DS4_N_INDEXER_HEAD_DIM &&
+            layer->indexer_compressor_gate->dim[1] ==
+                2u * DS4_N_INDEXER_HEAD_DIM) {
+            const int quad = ds4_gpu_matmul_f16_quad_tensor(
+                metal_graph_comp_kv_cur(g), metal_graph_comp_sc_cur(g),
+                metal_graph_index_comp_kv_cur(g),
+                metal_graph_index_comp_sc_cur(g),
+                model->map, model->size,
+                layer->attn_compressor_kv->abs_offset,
+                layer->attn_compressor_gate->abs_offset,
+                layer->indexer_compressor_kv->abs_offset,
+                layer->indexer_compressor_gate->abs_offset,
+                DS4_N_EMBD, comp_width,
+                2u * DS4_N_INDEXER_HEAD_DIM, metal_graph_attn_norm(g));
+            if (quad < 0) ok = false;
+            else if (quad > 0) quad_projected = true;
+        }
+#endif
         if (ok && quad_store == 0 && ratio == 4u &&
             !metal_graph_use_reference_compressor_pair_proj() &&
             getenv("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_QUAD_STORE") == NULL &&
@@ -22737,8 +22766,9 @@ static bool metal_graph_encode_decode_layer_phase(
             ok = false;
         } else if (quad_store > 0) {
             comp_state_already_stored = true;
+            quad_projected = true;
         }
-        if (ok && quad_store == 0 && !metal_graph_use_reference_compressor_pair_proj()) {
+        if (ok && !quad_projected && !metal_graph_use_reference_compressor_pair_proj()) {
             const int fused_store =
                 ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                         metal_graph_comp_kv_cur(g),
@@ -22772,7 +22802,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                       metal_graph_attn_norm(g),
                                                       1) != 0;
             }
-        } else if (quad_store == 0) {
+        } else if (!quad_projected) {
             if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_comp_kv_cur(g), model->map, model->size,
                                                      layer->attn_compressor_kv->abs_offset,
                                                      DS4_N_EMBD, comp_width,
@@ -22867,7 +22897,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 ok = false;
             }
             bool index_state_already_stored = quad_store > 0;
-            if (ok && quad_store == 0 && !metal_graph_use_reference_compressor_pair_proj()) {
+            if (ok && !quad_projected && !metal_graph_use_reference_compressor_pair_proj()) {
                 const int fused_store =
                     ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                             metal_graph_comp_kv_cur(g),
@@ -22901,7 +22931,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                           metal_graph_attn_norm(g),
                                                           1) != 0;
                 }
-            } else if (quad_store == 0) {
+            } else if (!quad_projected) {
                 if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_comp_kv_cur(g), model->map, model->size,
                                                          layer->indexer_compressor_kv->abs_offset,
                                                          DS4_N_EMBD, index_width,
@@ -22913,8 +22943,16 @@ static bool metal_graph_encode_decode_layer_phase(
             }
             DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_proj");
             const uint32_t index_row = g->layer_n_index_comp[il];
-            if (ok) ok = ds4_gpu_compressor_update_tensor(metal_graph_comp_kv_cur(g),
-                                                            metal_graph_comp_sc_cur(g),
+            ds4_gpu_tensor *index_comp_kv =
+                quad_projected && quad_store == 0
+                    ? metal_graph_index_comp_kv_cur(g)
+                    : metal_graph_comp_kv_cur(g);
+            ds4_gpu_tensor *index_comp_sc =
+                quad_projected && quad_store == 0
+                    ? metal_graph_index_comp_sc_cur(g)
+                    : metal_graph_comp_sc_cur(g);
+            if (ok) ok = ds4_gpu_compressor_update_tensor(index_comp_kv,
+                                                            index_comp_sc,
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],
                                                             g->layer_index_comp_cache[il],

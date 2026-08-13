@@ -65,6 +65,7 @@ enumeration.  Inter-stage activations use 16 bits.
 | SSD streaming, 2 GiB cold cache | 2.67 decode token/s |
 | gfx906 WMMA compatibility | `max_err=0`, 8,192 values |
 | Router wave32 -> native wave64 microbenchmark | 89.4 -> 31.4 us |
+| F16 attention+indexer compressor projection fusion | 12.57 -> 13.18-13.23 token/s (+4.9-5.3%) |
 
 The controlled legacy-vs-gfx906 workgroup A/B improved end-to-end decode by
 5.0%. Isolated Q8 decode improved 18.5%; F16-pair results were bit-identical
@@ -105,6 +106,12 @@ modes for the same arithmetic prompt.
 - Add `make gfx906`, architecture-selectable ROCm targets, and real-device
   WMMA, Q8, F16-pair, router, attention, and long-context regressions.
 - Pack two Q8 logical rows per wave64 and tune F16-pair workgroups for 60 CUs.
+- Fuse the two F16 compressor pairs into one shared-input decode dispatch on
+  gfx906; the real 7168-to-1024/256 regression is bit-exact against the two
+  separate pair kernels.
+- Cache the six active Q8 intermediate expert rows in LDS for the direct Q2
+  down projection, avoiding repeated global reads while retaining the same
+  per-slot accumulation order.
 - Map a router row to one native wave64, retaining existing paths elsewhere.
 - Use cooperative score dots only for the measured short-cache range.
 - Increase one-token IQ2 gate/up occupancy from 96 to 384 workgroups on gfx906
@@ -146,6 +153,7 @@ ROCR_VISIBLE_DEVICES=2 make rocm-regression \
   gfx906 WMMA: 256 tiles / 8192 values, max_err=0   PASS
   Q8 wave64 packing: 4097 rows, 0 mismatches        PASS
   F16-pair sizing: 513 rows, 0 mismatches           PASS
+  F16 compressor quad: max_abs=0, 0 mismatches      PASS
   router wave64: 256/384 experts, 0 mismatches      PASS
 ./ds4_test --server                                  PASS
 ASan + UBSan focused schema/tool-replay tests        PASS

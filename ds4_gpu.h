@@ -872,6 +872,24 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos);
 
+int ds4_gpu_matmul_f16_quad_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        ds4_gpu_tensor       *out2,
+        ds4_gpu_tensor       *out3,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              weight2_offset,
+        uint64_t              weight3_offset,
+        uint64_t              in_dim,
+        uint32_t              out_dim0,
+        uint32_t              out_dim1,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_f16_compressor_quad_available(void);
+
 int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
         ds4_gpu_tensor       *out0_kv,
         ds4_gpu_tensor       *out0_score,

@@ -829,6 +829,14 @@ static int routed_moe_launch(
         const uint32_t use_direct_down_sum6 =
             !preserve_down_slots && n_tokens == 1u &&
             n_expert <= DS4_ROCM_N_EXPERT_USED;
+#if defined(DS4_GFX906)
+        const uint32_t use_direct_down_shared_mid =
+            use_direct_down_sum6 && midq_blocks <= 8u &&
+            !cuda_env_present(
+                getenv("DS4_ROCM_DISABLE_MOE_Q2_DOWN_SHARED_MID"));
+#else
+        const uint32_t use_direct_down_shared_mid = 0u;
+#endif
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
         uint32_t *sorted_counts = NULL;
@@ -1587,16 +1595,33 @@ static int routed_moe_launch(
                         out_dim,
                         n_expert);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
-                        (float *)out->ptr,
-                        down_w,
-                        midq,
-                        (const int32_t *)selected_exec->ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert);
+                    if (use_direct_down_shared_mid) {
+                        const size_t shared_bytes =
+                            (size_t)n_expert * midq_blocks *
+                            sizeof(cuda_block_q8_K);
+                        moe_down_sum6_qwarp32_kernel<true>
+                                <<<sgrid, 256, shared_bytes>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    } else {
+                        moe_down_sum6_qwarp32_kernel<false><<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    }
                 }
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -2349,7 +2374,8 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<(out_dim + 31u) / 32u, 256>>>(
+                    moe_down_sum6_qwarp32_kernel<false>
+                            <<<(out_dim + 31u) / 32u, 256>>>(
                             (float *)out->ptr,
                             down_w,
                             midq,

@@ -261,6 +261,63 @@ __global__ static void matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+__global__ static void matmul_f16_quad_f32_sharedx_warp_rows_w32_kernel(
+        float *out0,
+        float *out1,
+        float *out2,
+        float *out3,
+        const __half *w0,
+        const __half *w1,
+        const __half *w2,
+        const __half *w3,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim0,
+        uint32_t out_dim1) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim0) return;
+    const __half *wr0 = w0 + (uint64_t)row * in_dim;
+    const __half *wr1 = w1 + (uint64_t)row * in_dim;
+    const bool has_pair1 = row < out_dim1;
+    const __half *wr2 = has_pair1 ? w2 + (uint64_t)row * in_dim : w2;
+    const __half *wr3 = has_pair1 ? w3 + (uint64_t)row * in_dim : w3;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        const float xv = shx[i];
+        acc0 += __half2float(wr0[i]) * xv;
+        acc1 += __half2float(wr1[i]) * xv;
+        if (has_pair1) {
+            acc2 += __half2float(wr2[i]) * xv;
+            acc3 += __half2float(wr3[i]) * xv;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (has_pair1) {
+        acc2 = warp_sum_f32(acc2);
+        acc3 = warp_sum_f32(acc3);
+    }
+    if (lane == 0u) {
+        out0[row] = acc0;
+        out1[row] = acc1;
+        if (has_pair1) {
+            out2[row] = acc2;
+            out3[row] = acc3;
+        }
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,

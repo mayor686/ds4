@@ -2318,6 +2318,7 @@ __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
     }
 }
 
+template <bool cache_midq = false>
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
@@ -2330,6 +2331,16 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    extern __shared__ cuda_block_q8_K shared_midq[];
+    const cuda_block_q8_K *midq_base = midq;
+    if constexpr (cache_midq) {
+        const uint32_t count = n_expert * midq_blocks;
+        for (uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+            shared_midq[i] = midq[i];
+        }
+        __syncthreads();
+        midq_base = shared_midq;
+    }
     if (row >= out_dim) return;
     float total = 0.0f;
     #pragma unroll
@@ -2338,7 +2349,8 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
         const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        const cuda_block_q8_K *xq =
+            midq_base + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
         for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
         acc = quarter_warp_sum_f32(acc, lane);

@@ -998,6 +998,76 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
     return 0;
 }
 
+extern "C" int ds4_gpu_f16_compressor_quad_available(void) {
+#if defined(DS4_GFX906)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+extern "C" int ds4_gpu_matmul_f16_quad_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        ds4_gpu_tensor *out2,
+        ds4_gpu_tensor *out3,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t weight2_offset,
+        uint64_t weight3_offset,
+        uint64_t in_dim,
+        uint32_t out_dim0,
+        uint32_t out_dim1,
+        const ds4_gpu_tensor *x) {
+#if !defined(DS4_GFX906)
+    return 0;
+#else
+    /* This is the fast decode equivalent of two shared-X pair launches.  The
+     * quality/graph-dump paths deliberately retain their ordered reference
+     * reductions, and other ROCm architectures retain their normal kernels. */
+    if (g_quality_mode || cuda_runtime_config()->graph_dump) return 0;
+    if (!out0 || !out1 || !out2 || !out3 || !x || !model_map ||
+        in_dim == 0u || in_dim > UINT32_MAX || out_dim0 == 0u ||
+        out_dim1 == 0u || out_dim1 > out_dim0 ||
+        in_dim > 8192u || in_dim * sizeof(float) > 65536u) return 0;
+    uint64_t bytes0 = 0, bytes1 = 0;
+    if (!cuda_u64_mul3_checked(out_dim0, in_dim, sizeof(uint16_t), &bytes0) ||
+        !cuda_u64_mul3_checked(out_dim1, in_dim, sizeof(uint16_t), &bytes1) ||
+        weight0_offset > model_size || bytes0 > model_size - weight0_offset ||
+        weight1_offset > model_size || bytes0 > model_size - weight1_offset ||
+        weight2_offset > model_size || bytes1 > model_size - weight2_offset ||
+        weight3_offset > model_size || bytes1 > model_size - weight3_offset ||
+        x->bytes < in_dim * sizeof(float) ||
+        out0->bytes < (uint64_t)out_dim0 * sizeof(float) ||
+        out1->bytes < (uint64_t)out_dim0 * sizeof(float) ||
+        out2->bytes < (uint64_t)out_dim1 * sizeof(float) ||
+        out3->bytes < (uint64_t)out_dim1 * sizeof(float)) return 0;
+    const __half *w0 = (const __half *)cuda_model_range_ptr(
+        model_map, weight0_offset, bytes0, "f16_quad0");
+    const __half *w1 = (const __half *)cuda_model_range_ptr(
+        model_map, weight1_offset, bytes0, "f16_quad1");
+    const __half *w2 = (const __half *)cuda_model_range_ptr(
+        model_map, weight2_offset, bytes1, "f16_quad2");
+    const __half *w3 = (const __half *)cuda_model_range_ptr(
+        model_map, weight3_offset, bytes1, "f16_quad3");
+    if (!w0 || !w1 || !w2 || !w3) return -1;
+    const uint32_t rows_per_block =
+        cuda_runtime_config()->f16_pair_decode_rpb;
+    matmul_f16_quad_f32_sharedx_warp_rows_w32_kernel<<<
+            (out_dim0 + rows_per_block - 1u) / rows_per_block,
+            rows_per_block * 32u,
+            (size_t)in_dim * sizeof(float)>>>(
+        (float *)out0->ptr, (float *)out1->ptr,
+        (float *)out2->ptr, (float *)out3->ptr,
+        w0, w1, w2, w3, (const float *)x->ptr,
+        (uint32_t)in_dim, out_dim0, out_dim1);
+    return cuda_ok(cudaGetLastError(), "matmul_f16_quad sharedx launch")
+        ? 1 : -1;
+#endif
+}
+
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;

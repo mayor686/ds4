@@ -633,6 +633,117 @@ static int check_owned_moe_combine(void) {
     return rc;
 }
 
+#if defined(DS4_ROCM_BUILD)
+static int check_f16_compressor_quad(void) {
+    if (!ds4_gpu_f16_compressor_quad_available()) {
+        fprintf(stderr, "gpu-regression: F16 compressor quad unavailable; skipped\n");
+        return 0;
+    }
+    enum { in_dim = 7168, out_dim0 = 1024, out_dim1 = 256 };
+    const uint64_t bytes0 =
+        (uint64_t)in_dim * out_dim0 * sizeof(uint16_t);
+    const uint64_t bytes1 =
+        (uint64_t)in_dim * out_dim1 * sizeof(uint16_t);
+    const uint64_t model_bytes = 2u * bytes0 + 2u * bytes1;
+    uint16_t *model = (uint16_t *)malloc((size_t)model_bytes);
+    float *x_host = (float *)malloc((size_t)in_dim * sizeof(float));
+    float *ref[4] = {
+        (float *)malloc((size_t)out_dim0 * sizeof(float)),
+        (float *)malloc((size_t)out_dim0 * sizeof(float)),
+        (float *)malloc((size_t)out_dim1 * sizeof(float)),
+        (float *)malloc((size_t)out_dim1 * sizeof(float)),
+    };
+    float *got[4] = {
+        (float *)malloc((size_t)out_dim0 * sizeof(float)),
+        (float *)malloc((size_t)out_dim0 * sizeof(float)),
+        (float *)malloc((size_t)out_dim1 * sizeof(float)),
+        (float *)malloc((size_t)out_dim1 * sizeof(float)),
+    };
+    if (!model || !x_host || !ref[0] || !ref[1] || !ref[2] || !ref[3] ||
+        !got[0] || !got[1] || !got[2] || !got[3]) return 1;
+
+    const uint16_t values[] = {
+        0x0000u, 0x3c00u, 0xbc00u, 0x3800u,
+        0xb800u, 0x3400u, 0xb400u,
+    };
+    for (uint64_t i = 0; i < model_bytes / sizeof(uint16_t); i++)
+        model[i] = values[(i * 17u + i / in_dim * 11u + 3u) %
+                          (sizeof(values) / sizeof(values[0]))];
+    for (uint32_t i = 0; i < in_dim; i++)
+        x_host[i] = (float)((int)((i * 29u + 7u) % 97u) - 48) / 512.0f;
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *ref_t[4] = {
+        ds4_gpu_tensor_alloc((uint64_t)out_dim0 * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)out_dim0 * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)out_dim1 * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)out_dim1 * sizeof(float)),
+    };
+    ds4_gpu_tensor *got_t[4] = {
+        ds4_gpu_tensor_alloc((uint64_t)out_dim0 * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)out_dim0 * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)out_dim1 * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)out_dim1 * sizeof(float)),
+    };
+    int rc = 1;
+    if (x && ref_t[0] && ref_t[1] && ref_t[2] && ref_t[3] &&
+        got_t[0] && got_t[1] && got_t[2] && got_t[3] &&
+        ds4_gpu_set_model_map(model, model_bytes) &&
+        ds4_gpu_tensor_write(x, 0, x_host,
+                             (uint64_t)in_dim * sizeof(float)) &&
+        ds4_gpu_matmul_f16_pair_tensor(
+            ref_t[0], ref_t[1], model, model_bytes, 0, bytes0,
+            in_dim, out_dim0, x, 1) &&
+        ds4_gpu_matmul_f16_pair_tensor(
+            ref_t[2], ref_t[3], model, model_bytes,
+            2u * bytes0, 2u * bytes0 + bytes1,
+            in_dim, out_dim1, x, 1) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_matmul_f16_quad_tensor(
+            got_t[0], got_t[1], got_t[2], got_t[3], model, model_bytes,
+            0, bytes0, 2u * bytes0, 2u * bytes0 + bytes1,
+            in_dim, out_dim0, out_dim1, x) == 1 &&
+        ds4_gpu_synchronize()) {
+        rc = 0;
+        uint64_t nonexact = 0;
+        float max_abs = 0.0f;
+        for (uint32_t output = 0; output < 4u && rc == 0; output++) {
+            const uint32_t count = output < 2u ? out_dim0 : out_dim1;
+            if (!ds4_gpu_tensor_read(
+                    ref_t[output], 0, ref[output],
+                    (uint64_t)count * sizeof(float)) ||
+                !ds4_gpu_tensor_read(
+                    got_t[output], 0, got[output],
+                    (uint64_t)count * sizeof(float))) {
+                rc = 1;
+                break;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                const float delta = fabsf(ref[output][i] - got[output][i]);
+                if (delta != 0.0f) nonexact++;
+                if (delta > max_abs) max_abs = delta;
+            }
+        }
+        fprintf(stderr,
+                "gpu-regression: F16 compressor quad max_abs=%g "
+                "nonexact=%" PRIu64 "\n",
+                (double)max_abs, nonexact);
+        if (nonexact != 0u) rc = 1;
+    }
+
+    for (uint32_t i = 0; i < 4u; i++) {
+        ds4_gpu_tensor_free(got_t[i]);
+        ds4_gpu_tensor_free(ref_t[i]);
+        free(got[i]);
+        free(ref[i]);
+    }
+    ds4_gpu_tensor_free(x);
+    free(x_host);
+    free(model);
+    return rc;
+}
+#endif
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
@@ -640,6 +751,9 @@ int main(void) {
     if (check_decode_attention_ring_reference() != 0) rc = 1;
     if (check_decode_attention_indexed_reference() != 0) rc = 1;
     if (check_owned_moe_combine() != 0) rc = 1;
+#if defined(DS4_ROCM_BUILD)
+    if (check_f16_compressor_quad() != 0) rc = 1;
+#endif
     ds4_gpu_cleanup();
     if (rc == 0) puts("GPU long-context regression: OK");
     return rc;

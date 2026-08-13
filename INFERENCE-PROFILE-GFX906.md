@@ -1025,3 +1025,51 @@ totale dei cinque hop resta sotto l'1% dei 78-82 ms/token. Il `downstream_wait`
 La generazione è autoregressiva e non può mettere in pipeline due token target.
 Ulteriore threading CPU o una pipeline più profonda non offre quindi un margine
 significativo su questa topologia; il prossimo lavoro utile resta nei kernel GPU.
+
+## Aggiornamento 13 agosto 2026: compressori FP16 e down MoE
+
+Un profilo per fase del decode ha mostrato che le proiezioni F16 del
+compressore attention e del compressore indexer leggevano due volte lo stesso
+input normalizzato da 7.168 float, con due dispatch distinti. Il nuovo kernel
+gfx906 esegue insieme le quattro matrici (due coppie), caricando l'input una
+sola volta in LDS. L'ordine di accumulo e la riduzione wave32 di ogni riga non
+cambiano.
+
+| Decode PP6, modello 0731 | Prima | Dopo | Variazione |
+|---|---:|---:|---:|
+| 8K prefill + 256 token | 12,57 tok/s | 13,18-13,23 tok/s | **+4,85-5,25%** |
+| Prefill dello stesso test | 182,79 tok/s | 182,52-183,10 tok/s | ±0,17% (rumore) |
+| Profiler breve 1K | 13,68 tok/s | 14,64 tok/s | **+7,02%** |
+| Proiezioni compressori/layer | ~0,348 ms | ~0,155 ms | **-55,5%** |
+
+Il test deterministico usa esattamente le forme 7.168→1.024 e 7.168→256 e
+confronta tutti i quattro output: massimo assoluto zero e nessun elemento
+diverso. Anche 16 token nel profiler e 256 token nel test lungo coincidono ID
+per ID col percorso precedente. L'ottimizzazione è compilata soltanto per
+gfx906; `DS4_ROCM_DISABLE_F16_COMPRESSOR_QUAD=1` resta come rollback.
+
+Il down-projection Q2 del Routed-MoE rileggeva da memoria globale i circa
+14 KiB delle sei attivazioni intermedie Q8 per ogni blocco di righe. Copiarle
+una volta in LDS accelera la sola fase down del 4–6%, ma la fase pesa circa il
+28% del MoE e il beneficio end-to-end misurato è circa 0,2%. Il percorso viene
+comunque mantenuto perché l'output EP2 resta bit-esatto e non cambia il layout
+dei pesi; rollback: `DS4_ROCM_DISABLE_MOE_Q2_DOWN_SHARED_MID=1`.
+
+Tentativi esclusi durante la stessa campagna:
+
+- parallelizzare i sei expert nella down projection: neutro o regressivo;
+- fondere i due dot IQ2 gate/up: +23,6% di latenza per pressione registri;
+- workgroup gate/up da 128 o 512 thread: nessun guadagno;
+- fondere anche il salvataggio degli stati nei quattro matvec: i due kernel
+  eliminati valgono troppo poco e il throughput lungo resta 13,22 tok/s; la
+  variante è stata rimossa.
+
+Risultati riproducibili:
+
+- riferimento lungo: `.ds4-benchmarks/gfx906-0731/20260813-111835-baseline`;
+- percorso finale lungo: `.ds4-benchmarks/gfx906-0731/20260813-083028-baseline`;
+- replica finale lunga: `.ds4-benchmarks/gfx906-0731/20260813-123257-baseline`;
+- profiler A/B: `.ds4-benchmarks/gfx906-0731/20260813-082953-graph` e
+  `.ds4-benchmarks/gfx906-0731/20260813-082038-graph`;
+- verifica finale token/profilo:
+  `.ds4-benchmarks/gfx906-0731/20260813-113942-graph`.
