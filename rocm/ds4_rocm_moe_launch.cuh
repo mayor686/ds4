@@ -820,8 +820,13 @@ static int routed_moe_launch(
             use_decode_lut_gate &&
             !cuda_env_present(
                 getenv("DS4_ROCM_DISABLE_MOE_IQ2_RPG1"));
+        const uint32_t use_decode_lut_split16 =
+            use_decode_lut_rpg1 &&
+            !cuda_env_present(
+                getenv("DS4_ROCM_DISABLE_MOE_IQ2_GATEUP_SPLIT16"));
 #else
         const uint32_t use_decode_lut_rpg1 = 0u;
+        const uint32_t use_decode_lut_split16 = 0u;
 #endif
         const uint32_t gate_row_span = 1024u;
         const uint32_t down_row_span = 1024u;
@@ -1333,7 +1338,8 @@ static int routed_moe_launch(
                         clamp);
                 }
             } else if (ok) {
-                const uint32_t gate_rows = use_decode_lut_rpg1 ? 32u : 128u;
+                const uint32_t gate_rows = use_decode_lut_split16 ? 16u :
+                                           use_decode_lut_rpg1 ? 32u : 128u;
                 dim3 qgrid((expert_mid_dim + gate_rows - 1u) / gate_rows,
                            pair_count, 1);
                 if (q4k_path) {
@@ -1354,7 +1360,26 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    if (use_decode_lut_rpg1) {
+                    if (use_decode_lut_split16) {
+                        moe_gate_up_mid_decode_lut_split16_kernel
+                                <<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            write_gate_up,
+                            0xffffffffu,
+                            clamp);
+                    } else if (use_decode_lut_rpg1) {
                         moe_gate_up_mid_decode_lut_qwarp32_kernel<1u>
                                 <<<qgrid, 256>>>(
                             (float *)gate->ptr,

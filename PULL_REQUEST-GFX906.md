@@ -66,6 +66,7 @@ enumeration.  Inter-stage activations use 16 bits.
 | gfx906 WMMA compatibility | `max_err=0`, 8,192 values |
 | Router wave32 -> native wave64 microbenchmark | 89.4 -> 31.4 us |
 | F16 attention+indexer compressor projection fusion | 12.57 -> 13.18-13.23 token/s (+4.9-5.3%) |
+| IQ2 gate/up split across 8-lane subgroups | 142.4 -> 135.1 us; full Routed-MoE 0.2597 -> 0.2506 ms |
 
 The controlled legacy-vs-gfx906 workgroup A/B improved end-to-end decode by
 5.0%. Isolated Q8 decode improved 18.5%; F16-pair results were bit-identical
@@ -116,6 +117,8 @@ modes for the same arithmetic prompt.
 - Use cooperative score dots only for the measured short-cache range.
 - Increase one-token IQ2 gate/up occupancy from 96 to 384 workgroups on gfx906
   while preserving each output row's reduction order.
+- Split one-token IQ2 gate and up across the two 8-lane halves of a logical
+  16-lane group, reducing live accumulators while preserving bit-exact output.
 - Transpose only the selected indexed-attention K rows for coalesced Q·K reads,
   retaining the original V layout and FP32 accumulation order.
 - Fuse indexed-attention inverse RoPE into the final attention workgroup; the
