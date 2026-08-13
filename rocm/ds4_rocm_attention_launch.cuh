@@ -696,9 +696,16 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             g_rocm_decode_attn_rope.armed = 0;
             g_rocm_decode_attn_rope.used = 1;
         }
+        uint32_t indexed_threads = 256u;
+#if defined(DS4_GFX906)
+        if (transpose && head_dim == 512u && !cuda_env_present(getenv(
+                "DS4_ROCM_DISABLE_ATTENTION_INDEXED_V_THREADS512"))) {
+            indexed_threads = 512u;
+        }
+#endif
         if (comp_kv_f16)
             attention_decode_indexed_mixed_one_fast_oldhip_kernel<true><<<
-                    (unsigned)n_head, 256, shmem>>>(
+                    (unsigned)n_head, indexed_threads, shmem>>>(
                 (float *)heads->ptr,
                 (const float *)q->ptr,
                 (const float *)raw_kv->ptr,
@@ -720,7 +727,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 rope);
         else
             attention_decode_indexed_mixed_one_fast_oldhip_kernel<false><<<
-                    (unsigned)n_head, 256, shmem>>>(
+                    (unsigned)n_head, indexed_threads, shmem>>>(
                 (float *)heads->ptr,
                 (const float *)q->ptr,
                 (const float *)raw_kv->ptr,

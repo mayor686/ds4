@@ -1090,6 +1090,32 @@ percorso accettato usa 256 thread ed e' il default soltanto su gfx906;
 Il benchmark PP6 end-to-end resta da ripetere quando tutte le sei GPU sono
 libere: durante questa misura tre schede erano occupate da un altro server.
 
+## Aggiornamento 14 agosto 2026: weighted-V indexed a 512 thread
+
+Dopo il transpose delle righe K, il gather richiede soltanto circa 9 us: quasi
+tutto il tempo residuo dell'attenzione indexed e' nel kernel che calcola Q.K,
+softmax e weighted-V. Con 256 thread ogni lane produceva due delle 512
+dimensioni V. Il percorso gfx906 usa ora 512 thread soltanto quando il
+transpose e' realmente attivo e `head_dim=512`, assegnando una dimensione V a
+ciascuna lane.
+
+La fase score continua intenzionalmente a usare soltanto i primi 256 thread:
+assegnazione delle righe, ordine dei dot e riduzione softmax restano quindi
+invariati. Il test confronta direttamente tutti i 32.768 output dei due
+workgroup e trova massimo assoluto zero, 32.768/32.768 valori identici e lo
+stesso hash `1e83cc160fa61082`.
+
+| Attention indexed 16K, 64 head x 512 | 256 thread | 512 thread | Variazione |
+|---|---:|---:|---:|
+| Smoke test, replica A | 0,378 ms | 0,315 ms | **-16,7%** |
+| Smoke test, replica B | 0,381 ms | 0,316 ms | **-17,1%** |
+| Kernel principale, `rocprofv3` | 381,0 us | 313,5 us | **-17,7%** |
+
+I casi senza transpose e i contesti per cui `top_k > n_comp` restano a 256
+thread. `DS4_ROCM_DISABLE_ATTENTION_INDEXED_V_THREADS512=1` ripristina il
+percorso precedente. Anche per questo incremento il gate PP6 sul modello reale
+resta rinviato finche' le sei GPU non sono libere.
+
 Risultati riproducibili:
 
 - riferimento lungo: `.ds4-benchmarks/gfx906-0731/20260813-111835-baseline`;

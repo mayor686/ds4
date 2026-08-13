@@ -335,13 +335,14 @@ static int check_decode_attention_indexed_reference(void) {
     float *comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
     int32_t *topk_host = (int32_t *)malloc(top_k * sizeof(int32_t));
     float *heads_host = (float *)malloc((size_t)q_count * sizeof(float));
+    float *threads256_heads = (float *)malloc((size_t)q_count * sizeof(float));
     const int compare_paths = getenv("DS4_TEST_ATTENTION_AB") != NULL;
     float *stable_heads = compare_paths
         ? (float *)malloc((size_t)q_count * sizeof(float)) : NULL;
     float *reference = (float *)malloc((size_t)q_count * sizeof(float));
     float *scores = (float *)malloc((n_raw + top_k) * sizeof(float));
     if (!sinks || !q_host || !raw_host || !comp_host || !topk_host ||
-        !heads_host || (compare_paths && !stable_heads) ||
+        !heads_host || !threads256_heads || (compare_paths && !stable_heads) ||
         !reference || !scores) return 1;
 
     for (uint32_t h = 0; h < n_head; h++)
@@ -408,6 +409,40 @@ static int check_decode_attention_indexed_reference(void) {
         const int warm = 5;
         const int iters = 50;
         int ok = 1;
+        float threads_path_max_abs = 0.0f;
+        uint64_t threads_path_exact = 0;
+        const int caller_disabled_threads512 = getenv(
+            "DS4_ROCM_DISABLE_ATTENTION_INDEXED_V_THREADS512") != NULL;
+        setenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_V_THREADS512", "1", 1);
+        ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                heads, sinks, n_head * sizeof(float), 0, q, raw, comp, 0,
+                topk_t, 1, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                0, ratio, n_head, head_dim) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(heads, 0, threads256_heads,
+                                 q_count * sizeof(float));
+        unsetenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_V_THREADS512");
+        ok = ok && ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                heads, sinks, n_head * sizeof(float), 0, q, raw, comp, 0,
+                topk_t, 1, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                0, ratio, n_head, head_dim) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(heads, 0, heads_host,
+                                 q_count * sizeof(float));
+        if (caller_disabled_threads512)
+            setenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_V_THREADS512", "1", 1);
+        if (ok) {
+            for (uint64_t i = 0; i < q_count; i++) {
+                const float d = fabsf(heads_host[i] - threads256_heads[i]);
+                if (d > threads_path_max_abs) threads_path_max_abs = d;
+                if (d == 0.0f) threads_path_exact++;
+            }
+            fprintf(stderr,
+                    "gpu-regression: indexed attention 256/512 threads "
+                    "max_abs=%g exact=%" PRIu64 "/%" PRIu64 "\n",
+                    (double)threads_path_max_abs,
+                    threads_path_exact, q_count);
+        }
         if (stable_heads) {
             setenv("DS4_ROCM_DISABLE_ATTENTION_INDEXED_TRANSPOSE", "1", 1);
             for (int i = 0; ok && i < warm; i++) {
@@ -529,7 +564,8 @@ static int check_decode_attention_indexed_reference(void) {
                 free(rope_reference);
             }
 #endif
-            rc = (max_abs <= 2.0e-5f && max_rel <= 2.0e-3f &&
+            rc = (threads_path_exact == q_count &&
+                  max_abs <= 2.0e-5f && max_rel <= 2.0e-3f &&
                   !rope_regression_failed) ? 0 : 1;
         }
     }
@@ -538,7 +574,8 @@ static int check_decode_attention_indexed_reference(void) {
     ds4_gpu_tensor_free(raw);
     ds4_gpu_tensor_free(q);
     ds4_gpu_tensor_free(heads);
-    free(scores); free(reference); free(stable_heads); free(heads_host);
+    free(scores); free(reference); free(stable_heads); free(threads256_heads);
+    free(heads_host);
     free(topk_host);
     free(comp_host); free(raw_host); free(q_host); free(sinks);
     return rc;
