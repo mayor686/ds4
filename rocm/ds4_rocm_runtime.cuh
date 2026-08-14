@@ -6648,6 +6648,47 @@ extern "C" int ds4_gpu_set_model_map_spans(
     return 1;
 }
 
+extern "C" int ds4_gpu_rocm_replace_model_map_spans(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    if (!model_map || model_size == 0 || !offsets || !sizes || count == 0)
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size || sizes[i] == 0 ||
+            sizes[i] > model_size - offsets[i]) return 0;
+    }
+    if (!cuda_ok(cudaDeviceSynchronize(), "model residency replace sync"))
+        return 0;
+
+    /* Model-derived pointers may be retained by decode graphs, expanded Q8
+     * weights and the selected-expert streaming caches.  Drop those views
+     * before releasing the backing allocations; graph/session scratch and KV
+     * tensors are independent allocations and deliberately survive. */
+    ds4_gpu_decode_graphs_invalidate();
+    cuda_shared_gate_up_async_cleanup();
+#ifdef __HIP_PLATFORM_AMD__
+    hipblaslt_gemm_plan_clear();
+#endif
+    cuda_q8_f16_cache_release_all();
+    cuda_stream_selected_cache_release();
+    cuda_model_range_release_all();
+    cuda_model_image_release_all();
+    g_model_host_base = NULL;
+    g_model_device_base = NULL;
+    g_model_registered_size = 0;
+    g_model_device_owned = 0;
+    g_model_cache_full = 0;
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
+
+    return ds4_gpu_set_model_map_spans(
+            model_map, model_size, offsets, sizes, count, max_tensor_bytes);
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;

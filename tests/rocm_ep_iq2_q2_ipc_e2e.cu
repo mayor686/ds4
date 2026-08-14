@@ -56,6 +56,7 @@ typedef struct {
     ds4_rocm_tp_ipc_handle x;
     char name[64];
     uint64_t memory_bytes;
+    double remap_ms;
 } rank_handles;
 
 typedef struct {
@@ -181,6 +182,40 @@ static bool cache_shared_ranges(const unsigned char *model,
                                      kSharedDownBytes, "ep_shared_down");
 }
 
+static bool remap_owner_ranges(const unsigned char *model,
+                               uint64_t model_size,
+                               uint32_t base,
+                               uint32_t count,
+                               bool include_shared) {
+    uint64_t offsets[6]{};
+    uint64_t sizes[6]{};
+    uint32_t n = 0u;
+    uint64_t max_bytes = 0u;
+    if (count != 0u) {
+        const uint64_t gate_bytes = (uint64_t)count * kGateExpertBytes;
+        const uint64_t down_bytes = (uint64_t)count * kDownExpertBytes;
+        offsets[n] = kGateOffset + (uint64_t)base * kGateExpertBytes;
+        sizes[n++] = gate_bytes;
+        offsets[n] = kUpOffset + (uint64_t)base * kGateExpertBytes;
+        sizes[n++] = gate_bytes;
+        offsets[n] = kDownOffset + (uint64_t)base * kDownExpertBytes;
+        sizes[n++] = down_bytes;
+        max_bytes = gate_bytes > down_bytes ? gate_bytes : down_bytes;
+    }
+    if (include_shared) {
+        offsets[n] = kSharedGateOffset;
+        sizes[n++] = kSharedGateBytes;
+        offsets[n] = kSharedUpOffset;
+        sizes[n++] = kSharedGateBytes;
+        offsets[n] = kSharedDownOffset;
+        sizes[n++] = kSharedDownBytes;
+        if (kSharedGateBytes > max_bytes) max_bytes = kSharedGateBytes;
+        if (kSharedDownBytes > max_bytes) max_bytes = kSharedDownBytes;
+    }
+    return n != 0u && ds4_gpu_rocm_replace_model_map_spans(
+            model, model_size, offsets, sizes, n, max_bytes) != 0;
+}
+
 static bool allocate_buffers(moe_buffers *b, const float *host_x,
                              const int32_t *host_selected,
                              const float *host_weights) {
@@ -259,6 +294,7 @@ static int worker_main(int physical, uint32_t rank, uint32_t world,
                        const unsigned char *model, int model_fd,
                        const float *host_x, const int32_t *host_selected,
                        const float *host_weights, bool require_broadcast,
+                       bool remap_residency,
                        int ready_fd, int go_fd) {
     const uint32_t expert_base = kTotalExperts * rank / world;
     const uint32_t expert_end = kTotalExperts * (rank + 1u) / world;
@@ -267,12 +303,26 @@ static int worker_main(int physical, uint32_t rank, uint32_t world,
     setenv("ROCR_VISIBLE_DEVICES", visible, 1);
     if (!ds4_gpu_init() || !ds4_gpu_set_model_fd(model_fd) ||
         !ds4_gpu_set_model_map(model, kModelBytes) ||
-        !cache_owner_ranges(model, kModelBytes, expert_base,
-                            expert_end - expert_base)) return 20;
+        !(remap_residency ?
+              cache_owner_ranges(model, kModelBytes, 0u, kTotalExperts) :
+              cache_owner_ranges(model, kModelBytes, expert_base,
+                                  expert_end - expert_base))) return 20;
     moe_buffers buffers{};
-    if (!allocate_buffers(&buffers, host_x, host_selected, host_weights) ||
-        !run_owned(&buffers, model, expert_base, expert_end - expert_base) ||
-        !ds4_gpu_synchronize())
+    if (!allocate_buffers(&buffers, host_x, host_selected, host_weights))
+        return 21;
+    double remap_ms = 0.0;
+    if (remap_residency) {
+        if (!run_full(&buffers, buffers.out, model) || !ds4_gpu_synchronize())
+            return 21;
+        const auto remap_begin = std::chrono::steady_clock::now();
+        if (!remap_owner_ranges(model, kModelBytes, expert_base,
+                                expert_end - expert_base, false)) return 21;
+        const auto remap_end = std::chrono::steady_clock::now();
+        remap_ms = std::chrono::duration<double>(
+                remap_end - remap_begin).count() * 1.0e3;
+    }
+    if (!run_owned(&buffers, model, expert_base,
+                   expert_end - expert_base) || !ds4_gpu_synchronize())
         return 21;
     /* Make the overlap result depend on the root broadcast instead of the
      * identical host-side initialization performed by every process. */
@@ -284,6 +334,7 @@ static int worker_main(int physical, uint32_t rank, uint32_t world,
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) return 22;
     std::snprintf(handles.name, sizeof(handles.name), "%s", properties.name);
     handles.memory_bytes = (uint64_t)properties.totalGlobalMem;
+    handles.remap_ms = remap_ms;
     if (!ds4_rocm_tp_ipc_export(ds4_gpu_tensor_contents(buffers.out),
                                 &handles.partial) ||
         !ds4_rocm_tp_ipc_export(ds4_gpu_tensor_contents(buffers.reduced),
@@ -364,7 +415,7 @@ int main(int argc, char **argv) {
     if (argc < 3 || std::strcmp(argv[1], "--devices")) {
         std::fprintf(stderr,
                      "usage: %s --devices ROOT,PEER[,PEER...] "
-                     "[--owner-counts N,N,...] [--overlap-shared]\n",
+                     "[--owner-counts N,N,...] [--overlap-shared] [--remap]\n",
                      argv[0]);
         return 1;
     }
@@ -382,6 +433,7 @@ int main(int argc, char **argv) {
     uint32_t owner_counts[kMaxRanks]{};
     const char *counts_arg = nullptr;
     bool overlap_shared = false;
+    bool remap_residency = false;
     for (int argi = 3; argi < argc; argi++) {
         if (!std::strcmp(argv[argi], "--owner-counts") &&
             argi + 1 < argc && !counts_arg) {
@@ -389,6 +441,9 @@ int main(int argc, char **argv) {
         } else if (!std::strcmp(argv[argi], "--overlap-shared") &&
                    !overlap_shared) {
             overlap_shared = true;
+        } else if (!std::strcmp(argv[argi], "--remap") &&
+                   !remap_residency) {
+            remap_residency = true;
         } else {
             std::fprintf(stderr, "invalid or duplicate argument: %s\n",
                          argv[argi]);
@@ -440,6 +495,7 @@ int main(int argc, char **argv) {
                                        (uint32_t)world, model, model_fd,
                                        host_x, host_selected, host_weights,
                                        overlap_shared,
+                                       remap_residency,
                                        ready[i][1], go[i][0]);
             _exit(rc);
         }
@@ -493,6 +549,18 @@ int main(int argc, char **argv) {
     const double full_ms =
         std::chrono::duration<double>(end - begin).count() * 1.0e3 /
         kIterations;
+
+    double root_remap_ms = 0.0;
+    if (remap_residency) {
+        const uint32_t root_count = overlap_shared ?
+            0u : kTotalExperts / (uint32_t)world;
+        const auto remap_begin = std::chrono::steady_clock::now();
+        if (!remap_owner_ranges(model, kModelBytes, 0u, root_count,
+                                overlap_shared)) return 13;
+        const auto remap_end = std::chrono::steady_clock::now();
+        root_remap_ms = std::chrono::duration<double>(
+                remap_end - remap_begin).count() * 1.0e3;
+    }
 
     std::vector<ds4_rocm_tp_ipc_handle> peer_partials((size_t)peers);
     std::vector<ds4_rocm_tp_ipc_handle> peer_reduced((size_t)peers);
@@ -607,6 +675,13 @@ int main(int argc, char **argv) {
     std::printf("  numerical: rms=%g max_abs=%g max_ref=%g rel=%g\n",
                 rms, max_abs, max_ref, rel);
     std::printf("  verification: %s\n", pass ? "PASS" : "FAIL");
+    if (remap_residency) {
+        std::printf("  PP->EP residency remap: root=%.2f ms", root_remap_ms);
+        for (int i = 0; i < peers; i++)
+            std::printf(" peer%d=%.2f ms", i + 1,
+                        handles[(size_t)i].remap_ms);
+        std::printf("\n");
+    }
 
     ds4_rocm_tp_star_destroy(broadcast_star);
     ds4_rocm_tp_star_destroy(star);
