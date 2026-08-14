@@ -236,9 +236,9 @@ __device__ __forceinline__ static uint32_t dev_pack_half2_bits(float x, float y)
 }
 
 __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
-    const uint32_t p = __popc(v) & 1u;
-    const uint32_t s = v ^ (p << 7u);
-    return s * 0x01010101u;
+    /* All callers pass cuda_ksigns_iq2xs entries, whose parity bit is already
+     * populated.  Replicate that byte directly instead of recomputing it. */
+    return v * 0x01010101u;
 }
 
 __device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
