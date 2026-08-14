@@ -6,10 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export MODEL_PATH="/home/mayor86/llama/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
-# The coordinator and four workers each own seven layers; the 32 GiB final GPU
-# owns eight layers plus the output head.  PCI references remain stable when
-# ROCr renumbers devices after a reboot.  On another six-gfx906 host, edit only
-# this ordered device list: put the largest-VRAM card last.
+# The 16 GiB coordinator owns six layers so the FP32 compressed cache retains
+# runtime scratch headroom at the 700K frontier.  The four middle workers own
+# seven layers each; the 32 GiB final GPU owns nine layers plus the output head.
+# PCI references remain stable when ROCr renumbers devices after a reboot.  On
+# another six-gfx906 host, edit only this ordered device list: put the
+# largest-VRAM card last.
 export CTX=700000
 export MAX_TOKENS=32768
 export PREFILL_CHUNK=256
@@ -32,6 +34,6 @@ export SSD_STREAMING_CACHE_EXPERTS=
 export SSD_STREAMING_PRELOAD_EXPERTS=
 export SSD_STREAMING_COLD=0
 export PIPELINE_DEVICES="pci:0000:46:00.0 pci:0000:63:00.0 pci:0000:66:00.0 pci:0000:30:00.0 pci:0000:03:00.0 pci:0000:43:00.0"
-export PIPELINE_LAYER_COUNTS="7 7 7 7 7 8"
+export PIPELINE_LAYER_COUNTS="6 7 7 7 7 9"
 
 exec "${SCRIPT_DIR}/run.sh"

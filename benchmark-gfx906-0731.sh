@@ -241,6 +241,13 @@ case "${MODE}" in
         PREFILL_CHUNK=256
         FRONTIER=699998
         GEN_TOKENS=1
+        # The seven-layer coordinator route leaves too little runtime
+        # headroom on its 16 GiB card once the FP32 compressed cache grows
+        # past roughly 275K tokens.  Move one layer to the 32 GiB final stage
+        # for the production 700K validation route.
+        COORD_LAYERS=0:5
+        WORKER_SPECS=("0 6:12" "1 13:19" "4 20:26" "5 27:33")
+        FINAL_LAYERS=34:output
         BENCH_EXTRA_ARGS+=("--repeat-prompt")
         ;;
     *)
