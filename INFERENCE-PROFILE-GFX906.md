@@ -1064,32 +1064,6 @@ Tentativi esclusi durante la stessa campagna:
   eliminati valgono troppo poco e il throughput lungo resta 13,22 tok/s; la
   variante è stata rimossa.
 
-### Split gate/up a sottogruppi da 8 lane
-
-Il kernel IQ2 gate/up precedente manteneva due accumulatori per lane e
-calcolava gate e up in sequenza nello stesso sottogruppo da otto lane. Su
-gfx906 il nuovo percorso assegna gate alle prime otto lane e up alle seconde
-otto lane di ciascun gruppo logico da 16. Le due meta' conservano la stessa
-assegnazione dei blocchi Q8 e lo stesso ordine di riduzione del kernel
-precedente, ma dimezzano gli accumulatori dot vivi per lane.
-
-Il test sintetico Flash-0731 confronta ora direttamente tutti i 4.096 output
-contro il kernel precedente nello stesso processo: massimo assoluto zero e
-nessun elemento diverso. Le repliche alternate sulle GPU fisiche 0 e 1 hanno
-misurato:
-
-| Routed-MoE IQ2/Q2, sei expert | Precedente | Split gate/up | Variazione |
-|---|---:|---:|---:|
-| Kernel gate/up, `rocprofv3` | 142,4 us | 135,1 us | **-5,1%** |
-| Routed-MoE completo, replica A | 0,2596 ms | 0,2508 ms | **-3,4%** |
-| Routed-MoE completo, replica B | 0,2597 ms | 0,2506 ms | **-3,5%** |
-
-Una variante split con 512 thread misurava 0,2686 ms ed e' stata rimossa. Il
-percorso accettato usa 256 thread ed e' il default soltanto su gfx906;
-`DS4_ROCM_DISABLE_MOE_IQ2_GATEUP_SPLIT16=1` ripristina il kernel precedente.
-Il benchmark PP6 end-to-end resta da ripetere quando tutte le sei GPU sono
-libere: durante questa misura tre schede erano occupate da un altro server.
-
 Risultati riproducibili:
 
 - riferimento lungo: `.ds4-benchmarks/gfx906-0731/20260813-111835-baseline`;

@@ -298,27 +298,6 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor *reference =
         ds4_gpu_tensor_alloc((uint64_t)kOutDim * sizeof(float));
     if (!reference) return 9;
-    std::vector<float> host_legacy(kOutDim), host_split16(kOutDim);
-    const bool caller_disabled_split16 =
-        getenv("DS4_ROCM_DISABLE_MOE_IQ2_GATEUP_SPLIT16") != nullptr;
-    setenv("DS4_ROCM_DISABLE_MOE_IQ2_GATEUP_SPLIT16", "1", 1);
-    if (!run_full(&buffers, reference, model) || !ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(reference, 0, host_legacy.data(),
-                             (uint64_t)kOutDim * sizeof(float))) return 10;
-    unsetenv("DS4_ROCM_DISABLE_MOE_IQ2_GATEUP_SPLIT16");
-    if (!run_full(&buffers, reference, model) || !ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(reference, 0, host_split16.data(),
-                             (uint64_t)kOutDim * sizeof(float))) return 10;
-    if (caller_disabled_split16)
-        setenv("DS4_ROCM_DISABLE_MOE_IQ2_GATEUP_SPLIT16", "1", 1);
-    uint32_t split16_nonexact = 0u;
-    double split16_max_abs = 0.0;
-    for (uint32_t i = 0; i < kOutDim; i++) {
-        const double diff =
-            std::fabs((double)host_legacy[i] - (double)host_split16[i]);
-        if (diff != 0.0) split16_nonexact++;
-        if (diff > split16_max_abs) split16_max_abs = diff;
-    }
     for (int i = 0; i < kWarmup; i++)
         if (!run_full(&buffers, reference, model)) return 10;
     if (!ds4_gpu_synchronize()) return 11;
@@ -389,11 +368,8 @@ int main(int argc, char **argv) {
                           WIFEXITED(status) && WEXITSTATUS(status) == 0;
     hipDeviceProp_t root_properties{};
     if (hipGetDeviceProperties(&root_properties, 0) != hipSuccess) return 21;
-    const bool pass = child_ok && split16_nonexact == 0u &&
-                      std::isfinite(rms) && rel <= 5.0e-4;
+    const bool pass = child_ok && std::isfinite(rms) && rel <= 5.0e-4;
     std::printf("ROCm Flash-0731 IQ2/Q2 EP2 decode, six active experts\n");
-    std::printf("  gfx906 split16 vs legacy: max_abs=%g nonexact=%u\n",
-                split16_max_abs, split16_nonexact);
     std::printf("  full single GPU: %.4f ms\n", full_ms);
     std::printf("  EP2 synchronized end-to-end: %.4f ms (%.2fx)\n",
                 total_ms, full_ms / total_ms);
