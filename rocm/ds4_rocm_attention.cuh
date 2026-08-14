@@ -856,10 +856,6 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     __shared__ uint32_t comp_slots[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ uint32_t comp_count_s;
     const uint32_t tid = threadIdx.x;
-    /* The 512-thread gfx906 path gives weighted-V one lane per output
-     * dimension while leaving score ownership and its reduction order at the
-     * proven 256-thread geometry. */
-    const uint32_t score_threads = blockDim.x > 256u ? 256u : blockDim.x;
     const float *qh = q + (uint64_t)h * head_dim;
     const float scale = rsqrtf((float)head_dim);
 
@@ -887,8 +883,7 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     const uint32_t n_rows = n_raw + comp_count;
 
     float local_max = sinks[h];
-    for (uint32_t r = tid; r < n_raw && tid < score_threads;
-         r += score_threads) {
+    for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
         const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
         const float *kv = raw_kv + (uint64_t)row * head_dim;
         float s = 0.0f;
@@ -915,8 +910,7 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
         scores[r] = s;
         local_max = fmaxf(local_max, s);
     }
-    for (uint32_t c = tid; c < comp_count && tid < score_threads;
-         c += score_threads) {
+    for (uint32_t c = tid; c < comp_count; c += blockDim.x) {
         const uint32_t row = comp_rows[c];
         const float *kv;
         if constexpr (COMP_F16) {
@@ -962,8 +956,7 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     const float max_score = attention_block_max_oldhip_w32(local_max);
 
     float local_sum = 0.0f;
-    for (uint32_t r = tid; r < n_rows && tid < score_threads;
-         r += score_threads) {
+    for (uint32_t r = tid; r < n_rows; r += blockDim.x) {
         const float w = expf(scores[r] - max_score);
         scores[r] = w;
         local_sum += w;
