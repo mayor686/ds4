@@ -25356,6 +25356,7 @@ static bool metal_graph_encode_output_head(
                                                    metal_graph_output_norm(g),
                                                    1);
     }
+    DS4_METAL_PROFILE_OUTPUT_STAGE("projection");
     if (ok) {
         metal_graph_debug_dump_tensor("result_output", metal_graph_logits(g), vocab_dim, DS4_N_LAYER, 0);
     }

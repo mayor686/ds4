@@ -1237,10 +1237,9 @@ parallelismo parziale:
 | EP5 `2/1/1/1/1` | 0,2532 ms | 0,1711 ms | **1,480x** |
 | Home-free EP4 `0/2/2/1/1`, routed + shared | 0,3265 ms | 0,1981 ms | **1,648x** |
 
-Tutte le repliche EP passano il confronto numerico. Questi dati convalidano il
-servizio EP persistente come prossimo intervento ad alto rendimento, ma non
-sono ancora un benchmark end-to-end: il default resta PP6 finche' residenza
-dei pesi, dispatch per layer e gate autoregressivo non sono integrati insieme.
+Tutte le repliche EP passano il confronto numerico. Questi dati hanno
+giustificato il successivo gate end-to-end, descritto sotto; da soli non
+giustificano l'abilitazione del percorso nel server.
 
 Risultati A/B completi:
 
@@ -1251,3 +1250,84 @@ Risultati A/B completi:
   `20260814-093934-decode-eager`, `20260814-094026-decode-eager`,
   `20260814-094226-decode-eager`, `20260814-094700-decode-eager`,
   `20260814-094841-decode-eager`.
+
+## Gate end-to-end TP/EP del 14 agosto 2026
+
+### Expert parallelism completo: respinto
+
+Il servizio EP persistente e' stato integrato temporaneamente nel decode reale,
+con ricollocazione dei pesi PP->EP e dispatch per layer. Il microbenchmark
+routed+shared rimane favorevole, ma il modello completo non recupera le
+barriere interprocesso ripetute per ogni layer:
+
+| Percorso | Prefill | Decode steady | Decode complessivo |
+|---|---:|---:|---:|
+| PP6 residente | 19,41 tok/s | circa 15,6 tok/s | **15,83 tok/s** |
+| EP persistente dopo transizione | 19,73 tok/s | **15,35 tok/s** | 9,15 tok/s |
+
+La transizione dei pesi richiede 11,306 s e, anche ignorandola, EP e' circa il
+3% piu' lento del PP6. L'arena compatta provata per ridurre il costo di
+residenza ha inoltre corrotto l'output. L'integrazione di produzione e'
+stata rimossa: il risultato sintetico di 1,45-1,65x riguarda soltanto una
+porzione che vale circa il 20% del token e non si traduce in un guadagno E2E.
+
+### Sharding della proiezione output Q8: respinto
+
+L'output `7168 -> 129280` e' un caso di tensor parallelism per righe: ogni GPU
+calcola vocaboli disgiunti. Il gate process-per-GPU `TP2..TP6` passa il
+confronto del candidato top-1; TP5 conserva il 99,7% del guadagno TP6:
+
+| Gate isolato TP5 | Tempo |
+|---|---:|
+| Output completo su una GPU + top-1 | 2,0538 ms |
+| TP5 sincronizzato + top-1 | 0,4807 ms |
+| Broadcast di 28 KiB | 0,0239 ms |
+| Riduzione del tempo isolato | **1,5731 ms, 4,27x** |
+
+Il server deve pero' conservare tutti i 129.280 logits per sampling e API, non
+soltanto il top-1. Il percorso completo con gather e' stato profilato cosi':
+
+| Proiezione reale | Tempo medio/token |
+|---|---:|
+| Q8 completa sulla GPU finale | **1,0522 ms** |
+| TP5: broadcast | 0,0207 ms |
+| TP5: dispatch | 0,0129 ms |
+| TP5: shard locale | 0,2398 ms |
+| TP5: attesa helper | 0,3944 ms |
+| TP5: gather logits | 0,3703 ms |
+| **TP5 totale** | **1,0380 ms** |
+
+Il risparmio effettivo e' appena 0,0142 ms, circa lo 0,02% di un token da
+65-68 ms. Nell'A/B non profilato la generazione passa da 14,85 a 14,79 tok/s;
+un secondo A/B profilato ha anche prodotto una divergenza greedy tardiva.
+L'integrazione server e' stata rimossa. Rimane il gate riproducibile
+`tests/rocm_tp_q8_output_ipc_e2e.cu`, utile se in futuro il protocollo potra'
+richiedere esplicitamente solo il top-1.
+
+### Mappa fisica e granularita' di prefill
+
+Anche le alternative senza modifiche ai kernel sono state chiuse con misure:
+
+| Variante, frontiera 8K | Prefill | Decode |
+|---|---:|---:|
+| Chunk 256 corrente | **196,71 tok/s** | **13,30 tok/s** |
+| Chunk 384 | 191,02 tok/s | 13,30 tok/s |
+| Chunk 512 | 180,78 tok/s | 13,22 tok/s |
+| Coordinatore spostato su ROCR 5, replica migliore | 192,37 tok/s | 13,27 tok/s |
+
+Una nuova prova a frontiera 1K spostando il coordinatore da ROCR 3 a ROCR 1
+ha peggiorato il decode da 15,48 a 14,82 tok/s e il prefill da 113,37 a
+112,37 tok/s, con divergenza greedy tardiva. La mappa BDF di `run-speed.sh`,
+il chunk 256 e PP6 `7/7/7/7/7/8` restano quindi il default misurato.
+
+### Margine residuo concreto
+
+Per una singola sequenza non resta un altro cambio di topologia gia'
+dimostrato positivo. Le due aree con peso sufficiente sono i kernel della
+singola GPU attiva: Routed-MoE vale circa 0,26-0,30 ms per layer e il blocco
+attention/rope circa 0,25 ms per layer a frontiera 1K, crescendo col contesto.
+Output sharding, Q8 K-split, EP completo, HIP Graph, chunk piu' grandi e nuove
+mappe fisiche sono ora esclusi da misure E2E. Il prossimo candidato deve quindi
+superare prima un micro-gate di almeno 5% sulla fase interessata e poi il gate
+PP6 8K/256 con token non nulli; guadagni inferiori a circa 0,5 ms/token non sono
+distinguibili in modo affidabile dal rumore e non vanno portati in produzione.
