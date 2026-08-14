@@ -43,14 +43,19 @@
 #   ./benchmark-gfx906-0731.sh long64k-700 # same frontier with production 700K allocation
 #   ./benchmark-gfx906-0731.sh long16k   # 16K prefill frontier, short decode
 #   ./benchmark-gfx906-0731.sh long300k  # 300K prefill frontier, short decode
+#
+# For an isolated A/B build, override the binary/source root and keep its
+# results separate, for example:
+#   DS4_BENCH_ROOT=/tmp/ds4-old DS4_BENCH_RESULT_ROOT=/tmp/ds4-old-results \
+#     ./benchmark-gfx906-0731.sh decode-eager
 set -euo pipefail
 
-ROOT=/home/mayor86/App/ds4
+ROOT="${DS4_BENCH_ROOT:-/home/mayor86/App/ds4}"
 MODEL=/home/mayor86/llama/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 DSPARK=/home/mayor86/llama/models/DeepSeek-V4-Flash-DSpark-support.gguf
 PROMPT="${ROOT}/tests/long_context_security_prompt.txt"
 LOGITS_PROMPT="${ROOT}/PULL_REQUEST-GFX906.md"
-RESULT_ROOT="${ROOT}/.ds4-benchmarks/gfx906-0731"
+RESULT_ROOT="${DS4_BENCH_RESULT_ROOT:-${ROOT}/.ds4-benchmarks/gfx906-0731}"
 
 # Fixed benchmark definition. Edit these values here, not in the environment,
 # when deliberately creating a new benchmark series.

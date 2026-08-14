@@ -1189,3 +1189,65 @@ EP persistente per processo, scambio iniziale degli handle HIP IPC e una
 barriera per layer. Finche' quel ciclo non passa il gate DeepSeek
 autoregressivo completo, il percorso di produzione resta PP6 e
 `run-speed.sh` non cambia.
+
+## Benchmark comparativo del 14 agosto 2026
+
+Il costo della semplificazione della parita' dei segni IQ2 e' stato misurato
+anche sul modello completo, non soltanto sul kernel isolato. La build corrente
+(`a8ee784`, con lo stesso percorso di produzione di `cb9ec7f`) e' stata
+confrontata con `fd6d4e6`, cioe' il commit immediatamente precedente alla
+modifica IQ2. La parte EP aggiunta da `a8ee784` e' usata soltanto dai test e
+non entra nel percorso di esecuzione di `ds4`.
+
+Le due build sono state compilate in directory separate e lanciate in ordine
+alternato. Il caso `decode-eager` usa PP6 `7/7/7/7/7/8`, contesto 1.024,
+256 token generati, chunk di prefill 256 e HIP Graph disabilitati. Dei cinque
+run della versione precedente, uno ha generato 256 token `0`: il suo apparente
+15,54 token/s deriva dal calcolo corrotto ed e' escluso dalle medie.
+
+| Metrica | `fd6d4e6`, 4 run validi | corrente, 5 run validi | Delta |
+|---|---:|---:|---:|
+| Decode medio | 14,7825 tok/s | 14,8760 tok/s | **+0,63%** |
+| Decode mediano | 14,78 tok/s | 14,88 tok/s | **+0,68%** |
+| Decode steady medio | 14,7975 tok/s | 14,8900 tok/s | **+0,63%** |
+| Prefill medio | 112,1625 tok/s | 112,2800 tok/s | +0,10% |
+| Primo token mediano | 67,764 ms | 67,132 ms | **-0,93%** |
+| Somma eval dei sei stadi/token | 65,9257 ms | 65,5218 ms | **-0,61%** |
+
+Il guadagno e' piccolo ma coerente tra throughput steady e tempo GPU aggregato;
+la parita' IQ2 semplificata rimane quindi abilitata. Il prefill e' invariato
+entro il rumore, come atteso per una modifica rivolta soprattutto al decode
+Routed-MoE.
+
+Questo A/B ha anche esposto che il greedy decode non e' ancora sempre
+bit-riproducibile. La sequenza di riferimento compare in 3/5 run di entrambe
+le build; la corrente ha due divergenze tardive non nulle, mentre la precedente
+ha una divergenza tardiva e il run interamente nullo. I cinque run correnti non
+mostrano quindi la corruzione catastrofica, ma il campione non dimostra che la
+patch l'abbia eliminata. Il confronto dei token resta un gate obbligatorio e
+le prestazioni del run nullo non devono mai essere accettate.
+
+La replica a tre campioni del gate EP sintetico conferma invece il margine del
+parallelismo parziale:
+
+| Distribuzione dei sei expert attivi | Sequenziale | EP completo | Speedup |
+|---|---:|---:|---:|
+| EP2 `3/3` | 0,2530 ms | 0,1908 ms | **1,326x** |
+| EP3 `2/2/2` | 0,2528 ms | 0,1852 ms | **1,365x** |
+| EP5 `2/1/1/1/1` | 0,2532 ms | 0,1711 ms | **1,480x** |
+| Home-free EP4 `0/2/2/1/1`, routed + shared | 0,3265 ms | 0,1981 ms | **1,648x** |
+
+Tutte le repliche EP passano il confronto numerico. Questi dati convalidano il
+servizio EP persistente come prossimo intervento ad alto rendimento, ma non
+sono ancora un benchmark end-to-end: il default resta PP6 finche' residenza
+dei pesi, dispatch per layer e gate autoregressivo non sono integrati insieme.
+
+Risultati A/B completi:
+
+- corrente: `.ds4-benchmarks/gfx906-0731/20260814-093840-decode-eager`,
+  `20260814-094117-decode-eager`, `20260814-094312-decode-eager`,
+  `20260814-094608-decode-eager`, `20260814-094748-decode-eager`;
+- precedente: `.ds4-benchmarks/gfx906-0731-ab/fd6/` con run
+  `20260814-093934-decode-eager`, `20260814-094026-decode-eager`,
+  `20260814-094226-decode-eager`, `20260814-094700-decode-eager`,
+  `20260814-094841-decode-eager`.
