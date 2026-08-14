@@ -1100,3 +1100,92 @@ Il launcher include ora `decode-verify` (1K/32 token) e `decode-verify8k`
 default richiede comunque il gate `window6` completo da 8K/256 token, perche'
 il candidato Q8 -> HC ha dimostrato che 32 token possono non esporre una
 corruzione tardiva.
+
+## Aggiornamento 14 agosto 2026: EP parziale sulle cinque GPU sane
+
+Il TP delle matrici Q8 rimane negativo: dividere attention output o shared
+expert non recupera il costo della sincronizzazione a granularita' decode.
+L'estensione del gate EP ai 256 expert reali ha invece confermato che la parte
+routed IQ2/Q2 scala. Il test accetta da due a sei processi, ownership arbitrarie
+dei sei expert attivi e usa una riduzione soltanto verso il proprietario del
+layer.
+
+Una matrice completa dei peer ha anche isolato un problema topologico: la GPU
+fisica 4, BDF `0000:63:00.0`, impiega 48-64 us per piccole riduzioni
+sincronizzate, contro 16-21 us delle altre schede. I trasferimenti grandi verso
+la stessa GPU raggiungono comunque 5-7 GiB/s. E' quindi un'anomalia di latenza
+small-message, non un limite generale di banda. La scheda da 32 GiB, fisica 2,
+funziona correttamente e velocemente pur essendo la variante `sramecc-`;
+`AMDGPU_ARCH` con entrambi i target `sramecc+` e `sramecc-` non spiega i
+precedenti problemi TP.
+
+### Router reale e collisioni
+
+Una cattura diagnostica temporanea su DeepSeek-V4-Flash ha raccolto 11.008
+selezioni (43 layer per 256 token). Sui 36 layer delle cinque GPU sane, la
+distribuzione degli expert tra cinque shard contigui produce 0,1941 ms attesi
+per il routed MoE, contro 0,2528 ms su una GPU: circa 1,30x. Una partizione
+offline basata sulla co-occorrenza, addestrata su meta' token e verificata
+sull'altra meta', riduce ancora la latenza EP del 3,2-3,3%. Questo secondo
+guadagno e' utile solo dopo aver integrato il parallelismo principale.
+
+### Home-free EP4 con sovrapposizione dello shared expert
+
+Il candidato piu' forte lascia la GPU proprietaria del layer senza expert
+routed per quel layer. I quattro peer sani possiedono tutti i 256 shard,
+mentre il root esegue lo shared expert Q8 in parallelo:
+
+```text
+root:    router -> broadcast 16 KiB -> shared expert --------> reduce -> HC
+helper:                          routed shard IQ2/Q2 ---------/
+helper:                          routed shard IQ2/Q2 ---------/
+helper:                          routed shard IQ2/Q2 ---------/
+helper:                          routed shard IQ2/Q2 ---------/
+```
+
+Il broadcast HIP IPC di 28 KiB verso quattro peer sani costa 15-20 us. Il gate
+integrato include broadcast, shared expert completo sul root, routed experts
+sui quattro helper e reduce finale. L'input dei helper viene prima avvelenato,
+cosi' la verifica numerica dipende davvero dal broadcast.
+
+| Gate sintetico Flash-0731 | Tempo |
+|---|---:|
+| Routed + shared sequenziali, una GPU | 0,3264 ms |
+| Pattern helper `2/2/1/1` completo | 0,1975-0,2090 ms |
+| Media dei nove pattern, pesata per sei scelte su quattro helper | circa 0,222-0,225 ms |
+| Accelerazione media | **circa 1,45-1,47x** |
+
+Tutti i nove pattern di collisione, incluso `6/0/0/0`, passano con errore
+relativo massimo inferiore a `4e-7`. Anche ciascuna delle cinque GPU sane usata
+a turno come root passa; sul pattern `2/2/1/1` i tempi osservati sono
+0,202-0,212 ms. Lo shared expert da circa 0,085 ms viene quindi interamente
+nascosto dal lavoro degli helper nei pattern dominanti.
+
+Nel profilo del modello reale, routed e shared valgono rispettivamente circa
+0,298 e 0,105 ms per layer. Scalando prudentemente il risultato sintetico, il
+margine sui 36 layer sani e' stimato in 4,5-6,5 ms per token, ossia circa
+4-9% secondo la lunghezza del contesto. Questa e' una proiezione, non ancora
+un risultato end-to-end del server.
+
+### Residenza e piano d'integrazione
+
+Il layout puo' conservare lo stesso budget routed attuale. Per gli otto layer
+posseduti dalla scheda da 32 GiB, gli altri quattro peer tengono 64 expert
+ciascuno. Per i 28 layer posseduti dalle schede da 16 GiB, la scheda da 32 GiB
+tiene 73 o 74 expert e gli altri tre peer 60 o 61. I totali restano esattamente
+1.792 slot expert-layer per ogni GPU da 16 GiB e 2.048 per quella da 32 GiB.
+La GPU fisica 4 mantiene i propri sette layer in PP e non partecipa al gruppo
+EP a bassa latenza.
+
+Passare dalla residenza PP alla residenza EP richiede di ricollocare circa
+9-10 GiB per GPU. La banda peer misurata stima 0,7-1,5 s se le copie sono
+parallele; il break-even e' quindi nell'ordine di 300-700 token generati. Il
+prefill deve restare PP6 e il resharing va eseguito soltanto prima di un decode
+abbastanza lungo, oppure preparato direttamente dal file modello.
+
+Il runtime distribuito attuale attiva un solo processo per stadio e lascia gli
+altri in attesa sulla catena TCP. L'integrazione richiede percio' un servizio
+EP persistente per processo, scambio iniziale degli handle HIP IPC e una
+barriera per layer. Finche' quel ciclo non passa il gate DeepSeek
+autoregressivo completo, il percorso di produzione resta PP6 e
+`run-speed.sh` non cambia.

@@ -29,6 +29,29 @@ __global__ static void ds4_rocm_tp_star_allreduce_kernel(
     for (uint32_t rank = 0; rank < world; rank++) outputs[rank][i] = sum;
 }
 
+__global__ static void ds4_rocm_tp_star_reduce_kernel(
+        float *const *inputs,
+        float *root_output,
+        uint32_t world,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = 0.0f;
+    for (uint32_t rank = 0; rank < world; rank++) sum += inputs[rank][i];
+    root_output[i] = sum;
+}
+
+__global__ static void ds4_rocm_tp_star_broadcast_kernel(
+        const float *root_input,
+        float *const *outputs,
+        uint32_t world,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float value = root_input[i];
+    for (uint32_t rank = 0; rank < world; rank++) outputs[rank][i] = value;
+}
+
 extern "C" int ds4_rocm_tp_ipc_export(
         void *device_ptr,
         ds4_rocm_tp_ipc_handle *handle) {
@@ -112,6 +135,38 @@ extern "C" int ds4_rocm_tp_star_allreduce_f32(
                        dim3((uint32_t)grid64), dim3(threads), 0, star->stream,
                        star->device_inputs, star->device_outputs,
                        (uint32_t)star->inputs.size(), count);
+    if (hipGetLastError() != hipSuccess) return 0;
+    return !synchronize || hipStreamSynchronize(star->stream) == hipSuccess;
+}
+
+extern "C" int ds4_rocm_tp_star_reduce_f32(
+        ds4_rocm_tp_star *star,
+        uint64_t count,
+        int synchronize) {
+    if (!star || !count || !star->stream) return 0;
+    const uint32_t threads = 256u;
+    const uint64_t grid64 = (count + threads - 1u) / threads;
+    if (grid64 > UINT32_MAX) return 0;
+    hipLaunchKernelGGL(ds4_rocm_tp_star_reduce_kernel,
+                       dim3((uint32_t)grid64), dim3(threads), 0, star->stream,
+                       star->device_inputs, star->outputs[0],
+                       (uint32_t)star->inputs.size(), count);
+    if (hipGetLastError() != hipSuccess) return 0;
+    return !synchronize || hipStreamSynchronize(star->stream) == hipSuccess;
+}
+
+extern "C" int ds4_rocm_tp_star_broadcast_f32(
+        ds4_rocm_tp_star *star,
+        uint64_t count,
+        int synchronize) {
+    if (!star || !count || !star->stream) return 0;
+    const uint32_t threads = 256u;
+    const uint64_t grid64 = (count + threads - 1u) / threads;
+    if (grid64 > UINT32_MAX) return 0;
+    hipLaunchKernelGGL(ds4_rocm_tp_star_broadcast_kernel,
+                       dim3((uint32_t)grid64), dim3(threads), 0, star->stream,
+                       star->inputs[0], star->device_outputs,
+                       (uint32_t)star->outputs.size(), count);
     if (hipGetLastError() != hipSuccess) return 0;
     return !synchronize || hipStreamSynchronize(star->stream) == hipSuccess;
 }

@@ -17,7 +17,7 @@
 #include "ds4_gpu.h"
 #include "ds4_rocm_tp.h"
 
-static constexpr uint32_t kTotalExperts = 8u;
+static constexpr uint32_t kTotalExperts = 256u;
 static constexpr uint32_t kActiveExperts = 6u;
 static constexpr uint32_t kInDim = 4096u;
 static constexpr uint32_t kMidDim = 2048u;
@@ -33,14 +33,27 @@ static constexpr uint64_t kUpOffset =
     kGateOffset + kTotalExperts * kGateExpertBytes;
 static constexpr uint64_t kDownOffset =
     kUpOffset + kTotalExperts * kGateExpertBytes;
-static constexpr uint64_t kModelBytes =
+static constexpr uint64_t kRoutedBytes =
     kDownOffset + kTotalExperts * kDownExpertBytes;
-static constexpr int kWarmup = 5;
+static constexpr uint64_t kSharedRowBytes = (kInDim / 32u) * 34u;
+static constexpr uint64_t kSharedDownRowBytes = (kMidDim / 32u) * 34u;
+static constexpr uint64_t kSharedGateBytes = kMidDim * kSharedRowBytes;
+static constexpr uint64_t kSharedDownBytes = kOutDim * kSharedDownRowBytes;
+static constexpr uint64_t kSharedGateOffset = kRoutedBytes;
+static constexpr uint64_t kSharedUpOffset =
+    kSharedGateOffset + kSharedGateBytes;
+static constexpr uint64_t kSharedDownOffset =
+    kSharedUpOffset + kSharedGateBytes;
+static constexpr uint64_t kModelBytes =
+    kSharedDownOffset + kSharedDownBytes;
+static constexpr int kWarmup = 50;
 static constexpr int kIterations = 100;
+static constexpr int kMaxRanks = 6;
 
 typedef struct {
     ds4_rocm_tp_ipc_handle partial;
     ds4_rocm_tp_ipc_handle reduced;
+    ds4_rocm_tp_ipc_handle x;
     char name[64];
     uint64_t memory_bytes;
 } rank_handles;
@@ -111,6 +124,23 @@ static void fill_q2(unsigned char *base, uint64_t bytes, uint32_t seed) {
     }
 }
 
+static void fill_q8(unsigned char *base, uint64_t in_dim, uint64_t out_dim,
+                    uint32_t seed) {
+    const uint64_t blocks = in_dim / 32u;
+    for (uint64_t row = 0; row < out_dim; row++) {
+        for (uint64_t block = 0; block < blocks; block++) {
+            unsigned char *q = base + (row * blocks + block) * 34u;
+            q[0] = 0x00;
+            q[1] = 0x24; /* fp16 scale 0.015625 */
+            for (uint64_t i = 0; i < 32u; i++) {
+                const int value =
+                    (int)((row * 13u + block * 7u + i * 5u + seed) % 15u) - 7;
+                q[2u + i] = (unsigned char)(int8_t)value;
+            }
+        }
+    }
+}
+
 static void build_model(unsigned char *model) {
     for (uint32_t expert = 0; expert < kTotalExperts; expert++) {
         fill_iq2(model + kGateOffset + (uint64_t)expert * kGateExpertBytes,
@@ -120,6 +150,9 @@ static void build_model(unsigned char *model) {
         fill_q2(model + kDownOffset + (uint64_t)expert * kDownExpertBytes,
                 kDownExpertBytes, 17u + expert);
     }
+    fill_q8(model + kSharedGateOffset, kInDim, kMidDim, 3u);
+    fill_q8(model + kSharedUpOffset, kInDim, kMidDim, 7u);
+    fill_q8(model + kSharedDownOffset, kMidDim, kOutDim, 11u);
 }
 
 static bool cache_owner_ranges(const unsigned char *model, uint64_t model_size,
@@ -136,6 +169,16 @@ static bool cache_owner_ranges(const unsigned char *model, uint64_t model_size,
                model, model_size,
                kDownOffset + (uint64_t)base * kDownExpertBytes,
                (uint64_t)count * kDownExpertBytes, "ep_down");
+}
+
+static bool cache_shared_ranges(const unsigned char *model,
+                                uint64_t model_size) {
+    return ds4_gpu_cache_model_range(model, model_size, kSharedGateOffset,
+                                     kSharedGateBytes, "ep_shared_gate") &&
+           ds4_gpu_cache_model_range(model, model_size, kSharedUpOffset,
+                                     kSharedGateBytes, "ep_shared_up") &&
+           ds4_gpu_cache_model_range(model, model_size, kSharedDownOffset,
+                                     kSharedDownBytes, "ep_shared_down");
 }
 
 static bool allocate_buffers(moe_buffers *b, const float *host_x,
@@ -201,19 +244,41 @@ static bool run_full(moe_buffers *b, ds4_gpu_tensor *out,
         7.0f, b->x, nullptr, UINT32_MAX, true) != 0;
 }
 
-static int worker_main(int physical, const unsigned char *model, int model_fd,
+static bool run_shared(moe_buffers *b, ds4_gpu_tensor *out,
+                       const unsigned char *model) {
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+               b->gate, b->up, b->mid, model, kModelBytes,
+               kSharedGateOffset, kSharedUpOffset,
+               kInDim, kMidDim, b->x, 7.0f) &&
+           ds4_gpu_matmul_q8_0_tensor(
+               out, model, kModelBytes, kSharedDownOffset,
+               kMidDim, kOutDim, b->mid, 1u);
+}
+
+static int worker_main(int physical, uint32_t rank, uint32_t world,
+                       const unsigned char *model, int model_fd,
                        const float *host_x, const int32_t *host_selected,
-                       const float *host_weights, int ready_fd, int go_fd) {
+                       const float *host_weights, bool require_broadcast,
+                       int ready_fd, int go_fd) {
+    const uint32_t expert_base = kTotalExperts * rank / world;
+    const uint32_t expert_end = kTotalExperts * (rank + 1u) / world;
     char visible[24];
     std::snprintf(visible, sizeof(visible), "%d", physical);
     setenv("ROCR_VISIBLE_DEVICES", visible, 1);
     if (!ds4_gpu_init() || !ds4_gpu_set_model_fd(model_fd) ||
         !ds4_gpu_set_model_map(model, kModelBytes) ||
-        !cache_owner_ranges(model, kModelBytes, 4u, 4u)) return 20;
+        !cache_owner_ranges(model, kModelBytes, expert_base,
+                            expert_end - expert_base)) return 20;
     moe_buffers buffers{};
     if (!allocate_buffers(&buffers, host_x, host_selected, host_weights) ||
-        !run_owned(&buffers, model, 4u, 4u) || !ds4_gpu_synchronize())
+        !run_owned(&buffers, model, expert_base, expert_end - expert_base) ||
+        !ds4_gpu_synchronize())
         return 21;
+    /* Make the overlap result depend on the root broadcast instead of the
+     * identical host-side initialization performed by every process. */
+    if (require_broadcast &&
+        (!ds4_gpu_tensor_fill_f32(buffers.x, -1.0f, kInDim) ||
+         !ds4_gpu_synchronize())) return 21;
     rank_handles handles{};
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) return 22;
@@ -223,12 +288,15 @@ static int worker_main(int physical, const unsigned char *model, int model_fd,
                                 &handles.partial) ||
         !ds4_rocm_tp_ipc_export(ds4_gpu_tensor_contents(buffers.reduced),
                                 &handles.reduced) ||
+        !ds4_rocm_tp_ipc_export(ds4_gpu_tensor_contents(buffers.x),
+                                &handles.x) ||
         !write_all(ready_fd, &handles, sizeof(handles))) return 23;
     for (int iter = 0; iter < kWarmup + kIterations; iter++) {
         char go = 0;
         if (!read_all(go_fd, &go, 1u)) return 24;
         const auto begin = std::chrono::steady_clock::now();
-        if (!run_owned(&buffers, model, 4u, 4u) || !ds4_gpu_synchronize())
+        if (!run_owned(&buffers, model, expert_base,
+                       expert_end - expert_base) || !ds4_gpu_synchronize())
             return 25;
         const auto end = std::chrono::steady_clock::now();
         const rank_sample sample{
@@ -242,24 +310,114 @@ static int worker_main(int physical, const unsigned char *model, int model_fd,
     return 0;
 }
 
+static int parse_devices(const char *arg, int *devices, int cap) {
+    if (!arg || !*arg) return 0;
+    char *copy = strdup(arg);
+    if (!copy) return 0;
+    int count = 0;
+    char *save = nullptr;
+    for (char *token = strtok_r(copy, ",", &save); token;
+         token = strtok_r(nullptr, ",", &save)) {
+        char *end = nullptr;
+        const long value = strtol(token, &end, 10);
+        if (count == cap || !end || *end || value < 0 || value > 255) {
+            free(copy);
+            return 0;
+        }
+        for (int i = 0; i < count; i++) {
+            if (devices[i] == value) {
+                free(copy);
+                return 0;
+            }
+        }
+        devices[count++] = (int)value;
+    }
+    free(copy);
+    return count;
+}
+
+static bool parse_owner_counts(const char *arg, uint32_t *counts, int world) {
+    if (!arg || !*arg) return false;
+    char *copy = strdup(arg);
+    if (!copy) return false;
+    int count = 0;
+    uint32_t sum = 0u;
+    char *save = nullptr;
+    for (char *token = strtok_r(copy, ",", &save); token;
+         token = strtok_r(nullptr, ",", &save)) {
+        char *end = nullptr;
+        const long value = strtol(token, &end, 10);
+        if (count == world || !end || *end || value < 0 ||
+            value > (long)kActiveExperts) {
+            free(copy);
+            return false;
+        }
+        counts[count++] = (uint32_t)value;
+        sum += (uint32_t)value;
+    }
+    free(copy);
+    return count == world && sum == kActiveExperts;
+}
+
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (argc != 3 || std::strcmp(argv[1], "--devices") ||
-        std::strchr(argv[2], ',') == nullptr) {
-        std::fprintf(stderr, "usage: %s --devices ROOT,PEER\n", argv[0]);
+    if (argc < 3 || std::strcmp(argv[1], "--devices")) {
+        std::fprintf(stderr,
+                     "usage: %s --devices ROOT,PEER[,PEER...] "
+                     "[--owner-counts N,N,...] [--overlap-shared]\n",
+                     argv[0]);
         return 1;
     }
-    int root_device = -1, peer_device = -1;
-    if (std::sscanf(argv[2], "%d,%d", &root_device, &peer_device) != 2 ||
-        root_device < 0 || peer_device < 0 || root_device == peer_device)
+    int devices[kMaxRanks]{};
+    const int world = parse_devices(argv[2], devices, kMaxRanks);
+    if (world < 2)
         return 1;
+    const int peers = world - 1;
     unsigned char *model = (unsigned char *)malloc((size_t)kModelBytes);
     float *host_x = (float *)malloc((size_t)kInDim * sizeof(float));
     if (!model || !host_x) return 2;
     build_model(model);
     for (uint32_t i = 0; i < kInDim; i++)
         host_x[i] = (float)((int)(i % 67u) - 33) * 0.00390625f;
-    const int32_t host_selected[kActiveExperts] = {0, 1, 2, 4, 5, 6};
+    uint32_t owner_counts[kMaxRanks]{};
+    const char *counts_arg = nullptr;
+    bool overlap_shared = false;
+    for (int argi = 3; argi < argc; argi++) {
+        if (!std::strcmp(argv[argi], "--owner-counts") &&
+            argi + 1 < argc && !counts_arg) {
+            counts_arg = argv[++argi];
+        } else if (!std::strcmp(argv[argi], "--overlap-shared") &&
+                   !overlap_shared) {
+            overlap_shared = true;
+        } else {
+            std::fprintf(stderr, "invalid or duplicate argument: %s\n",
+                         argv[argi]);
+            return 1;
+        }
+    }
+    if (counts_arg) {
+        if (!parse_owner_counts(counts_arg, owner_counts, world)) {
+            std::fprintf(stderr,
+                         "--owner-counts must contain %d counts whose sum "
+                         "is %u\n", world, kActiveExperts);
+            return 2;
+        }
+    } else {
+        for (uint32_t slot = 0; slot < kActiveExperts; slot++)
+            owner_counts[slot % (uint32_t)world]++;
+    }
+    if (overlap_shared && owner_counts[0] != 0u) {
+        std::fprintf(stderr,
+                     "--overlap-shared requires root owner count 0\n");
+        return 2;
+    }
+    int32_t host_selected[kActiveExperts]{};
+    uint32_t selected_slot = 0u;
+    for (uint32_t owner = 0; owner < (uint32_t)world; owner++) {
+        const uint32_t expert_base = kTotalExperts * owner / (uint32_t)world;
+        for (uint32_t local = 0; local < owner_counts[owner]; local++)
+            host_selected[selected_slot++] = (int32_t)(expert_base + local);
+    }
     const float host_weights[kActiveExperts] = {
         0.11f, 0.17f, 0.19f, 0.13f, 0.23f, 0.17f};
     FILE *model_file = tmpfile();
@@ -269,82 +427,138 @@ int main(int argc, char **argv) {
     const int model_fd = fileno(model_file);
     setenv("DS4_ROCM_WEIGHT_ARENA_CHUNK_MB", "256", 1);
 
-    int ready[2]{}, go[2]{};
-    if (pipe(ready) || pipe(go)) return 4;
-    const pid_t child = fork();
-    if (child < 0) return 5;
-    if (child == 0) {
-        close(ready[0]);
-        close(go[1]);
-        const int rc = worker_main(peer_device, model, model_fd, host_x,
-                                   host_selected, host_weights,
-                                   ready[1], go[0]);
-        _exit(rc);
+    int ready[kMaxRanks - 1][2]{}, go[kMaxRanks - 1][2]{};
+    pid_t children[kMaxRanks - 1]{};
+    for (int i = 0; i < peers; i++) {
+        if (pipe(ready[i]) || pipe(go[i])) return 4;
+        const pid_t child = fork();
+        if (child < 0) return 5;
+        if (child == 0) {
+            close(ready[i][0]);
+            close(go[i][1]);
+            const int rc = worker_main(devices[i + 1], (uint32_t)i + 1u,
+                                       (uint32_t)world, model, model_fd,
+                                       host_x, host_selected, host_weights,
+                                       overlap_shared,
+                                       ready[i][1], go[i][0]);
+            _exit(rc);
+        }
+        children[i] = child;
+        close(ready[i][1]);
+        close(go[i][0]);
     }
-    close(ready[1]);
-    close(go[0]);
-    rank_handles handles{};
-    if (!read_all(ready[0], &handles, sizeof(handles))) return 6;
+    std::vector<rank_handles> handles((size_t)peers);
+    for (int i = 0; i < peers; i++)
+        if (!read_all(ready[i][0], &handles[(size_t)i],
+                      sizeof(rank_handles))) return 6;
 
     char visible[24];
-    std::snprintf(visible, sizeof(visible), "%d", root_device);
+    std::snprintf(visible, sizeof(visible), "%d", devices[0]);
     setenv("ROCR_VISIBLE_DEVICES", visible, 1);
     if (!ds4_gpu_init() || !ds4_gpu_set_model_fd(model_fd) ||
         !ds4_gpu_set_model_map(model, kModelBytes) ||
-        !cache_owner_ranges(model, kModelBytes, 0u, kTotalExperts)) return 7;
+        !cache_owner_ranges(model, kModelBytes, 0u, kTotalExperts) ||
+        (overlap_shared && !cache_shared_ranges(model, kModelBytes))) return 7;
     moe_buffers buffers{};
     if (!allocate_buffers(&buffers, host_x, host_selected, host_weights))
         return 8;
     ds4_gpu_tensor *reference =
         ds4_gpu_tensor_alloc((uint64_t)kOutDim * sizeof(float));
-    if (!reference) return 9;
+    ds4_gpu_tensor *reference_routed = overlap_shared ?
+        ds4_gpu_tensor_alloc((uint64_t)kOutDim * sizeof(float)) : nullptr;
+    ds4_gpu_tensor *reference_shared = overlap_shared ?
+        ds4_gpu_tensor_alloc((uint64_t)kOutDim * sizeof(float)) : nullptr;
+    ds4_gpu_tensor *broadcast_copy = overlap_shared ?
+        ds4_gpu_tensor_alloc((uint64_t)kInDim * sizeof(float)) : nullptr;
+    if (!reference || (overlap_shared &&
+        (!reference_routed || !reference_shared || !broadcast_copy))) return 9;
     for (int i = 0; i < kWarmup; i++)
-        if (!run_full(&buffers, reference, model)) return 10;
+        if ((!overlap_shared && !run_full(&buffers, reference, model)) ||
+            (overlap_shared &&
+             (!run_full(&buffers, reference_routed, model) ||
+              !run_shared(&buffers, reference_shared, model) ||
+              !ds4_gpu_add_tensor(reference, reference_routed,
+                                  reference_shared, kOutDim)))) return 10;
     if (!ds4_gpu_synchronize()) return 11;
     auto begin = std::chrono::steady_clock::now();
     for (int i = 0; i < kIterations; i++)
-        if (!run_full(&buffers, reference, model)) return 12;
+        if ((!overlap_shared && !run_full(&buffers, reference, model)) ||
+            (overlap_shared &&
+             (!run_full(&buffers, reference_routed, model) ||
+              !run_shared(&buffers, reference_shared, model) ||
+              !ds4_gpu_add_tensor(reference, reference_routed,
+                                  reference_shared, kOutDim)))) return 12;
     if (!ds4_gpu_synchronize()) return 13;
     auto end = std::chrono::steady_clock::now();
     const double full_ms =
         std::chrono::duration<double>(end - begin).count() * 1.0e3 /
         kIterations;
 
+    std::vector<ds4_rocm_tp_ipc_handle> peer_partials((size_t)peers);
+    std::vector<ds4_rocm_tp_ipc_handle> peer_reduced((size_t)peers);
+    std::vector<ds4_rocm_tp_ipc_handle> peer_x((size_t)peers);
+    for (int i = 0; i < peers; i++) {
+        peer_partials[(size_t)i] = handles[(size_t)i].partial;
+        peer_reduced[(size_t)i] = handles[(size_t)i].reduced;
+        peer_x[(size_t)i] = handles[(size_t)i].x;
+    }
     ds4_rocm_tp_star *star = ds4_rocm_tp_star_create(
         ds4_gpu_tensor_contents(buffers.out),
         ds4_gpu_tensor_contents(buffers.reduced),
-        &handles.partial, &handles.reduced, 1u);
+        peer_partials.data(), peer_reduced.data(), (uint32_t)peers);
     if (!star) return 14;
-    double total_ms = 0.0, root_compute_ms = 0.0, peer_compute_ms = 0.0;
-    double wait_ms = 0.0, collective_ms = 0.0, trigger_ms = 0.0;
+    ds4_rocm_tp_star *broadcast_star = overlap_shared ?
+        ds4_rocm_tp_star_create(
+            ds4_gpu_tensor_contents(buffers.x),
+            ds4_gpu_tensor_contents(broadcast_copy),
+            peer_partials.data(), peer_x.data(), (uint32_t)peers) : nullptr;
+    if (overlap_shared && !broadcast_star) return 14;
+    double total_ms = 0.0, root_compute_ms = 0.0;
+    std::vector<double> peer_compute_ms((size_t)peers, 0.0);
+    double broadcast_ms = 0.0, wait_ms = 0.0, collective_ms = 0.0;
+    double trigger_ms = 0.0;
     for (int iter = 0; iter < kWarmup + kIterations; iter++) {
         const auto iter_begin = std::chrono::steady_clock::now();
+        if (overlap_shared &&
+            !ds4_rocm_tp_star_broadcast_f32(broadcast_star, kInDim, 1))
+            return 15;
+        const auto broadcast_end = std::chrono::steady_clock::now();
         const char signal = 1;
-        if (!write_all(go[1], &signal, 1u)) return 15;
+        for (int i = 0; i < peers; i++)
+            if (!write_all(go[i][1], &signal, 1u)) return 15;
         const auto trigger_end = std::chrono::steady_clock::now();
-        if (!run_owned(&buffers, model, 0u, 4u) || !ds4_gpu_synchronize())
+        const uint32_t root_end_expert = kTotalExperts / (uint32_t)world;
+        if ((!overlap_shared &&
+             !run_owned(&buffers, model, 0u, root_end_expert)) ||
+            (overlap_shared && !run_shared(&buffers, buffers.out, model)) ||
+            !ds4_gpu_synchronize())
             return 16;
         const auto root_end = std::chrono::steady_clock::now();
-        rank_sample sample{};
-        if (!read_all(ready[0], &sample, sizeof(sample))) return 17;
+        std::vector<rank_sample> samples((size_t)peers);
+        for (int i = 0; i < peers; i++)
+            if (!read_all(ready[i][0], &samples[(size_t)i],
+                          sizeof(rank_sample))) return 17;
         const auto ready_end = std::chrono::steady_clock::now();
-        if (!ds4_rocm_tp_star_allreduce_f32(star, kOutDim, 1)) return 18;
+        if (!ds4_rocm_tp_star_reduce_f32(star, kOutDim, 1)) return 18;
         const auto iter_end = std::chrono::steady_clock::now();
         if (iter >= kWarmup) {
             total_ms += std::chrono::duration<double>(iter_end - iter_begin).count() * 1.0e3;
-            trigger_ms += std::chrono::duration<double>(trigger_end - iter_begin).count() * 1.0e3;
+            broadcast_ms += std::chrono::duration<double>(broadcast_end - iter_begin).count() * 1.0e3;
+            trigger_ms += std::chrono::duration<double>(trigger_end - broadcast_end).count() * 1.0e3;
             root_compute_ms += std::chrono::duration<double>(root_end - trigger_end).count() * 1.0e3;
             wait_ms += std::chrono::duration<double>(ready_end - root_end).count() * 1.0e3;
             collective_ms += std::chrono::duration<double>(iter_end - ready_end).count() * 1.0e3;
-            peer_compute_ms += sample.compute_ms;
+            for (int i = 0; i < peers; i++)
+                peer_compute_ms[(size_t)i] += samples[(size_t)i].compute_ms;
         }
     }
     total_ms /= kIterations;
+    broadcast_ms /= kIterations;
     trigger_ms /= kIterations;
     root_compute_ms /= kIterations;
     wait_ms /= kIterations;
     collective_ms /= kIterations;
-    peer_compute_ms /= kIterations;
+    for (double &ms : peer_compute_ms) ms /= kIterations;
 
     std::vector<float> host_reference(kOutDim), host_reduced(kOutDim);
     if (!ds4_gpu_tensor_read(reference, 0, host_reference.data(),
@@ -362,29 +576,43 @@ int main(int argc, char **argv) {
     const double rms = std::sqrt(sq / kOutDim);
     const double rel = max_ref ? max_abs / max_ref : max_abs;
     const char done = 1;
-    if (!write_all(go[1], &done, 1u)) return 20;
-    int status = 0;
-    const bool child_ok = waitpid(child, &status, 0) >= 0 &&
-                          WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    for (int i = 0; i < peers; i++)
+        if (!write_all(go[i][1], &done, 1u)) return 20;
+    bool children_ok = true;
+    for (int i = 0; i < peers; i++) {
+        int status = 0;
+        const bool child_ok = waitpid(children[i], &status, 0) >= 0 &&
+                              WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        children_ok = children_ok && child_ok;
+    }
     hipDeviceProp_t root_properties{};
     if (hipGetDeviceProperties(&root_properties, 0) != hipSuccess) return 21;
-    const bool pass = child_ok && std::isfinite(rms) && rel <= 5.0e-4;
-    std::printf("ROCm Flash-0731 IQ2/Q2 EP2 decode, six active experts\n");
-    std::printf("  full single GPU: %.4f ms\n", full_ms);
-    std::printf("  EP2 synchronized end-to-end: %.4f ms (%.2fx)\n",
-                total_ms, full_ms / total_ms);
+    const bool pass = children_ok && std::isfinite(rms) && rel <= 5.0e-4;
+    std::printf("ROCm Flash-0731 IQ2/Q2 EP%d decode, six active experts%s\n",
+                world, overlap_shared ? " + root shared overlap" : "");
+    std::printf("  full single GPU%s: %.4f ms\n",
+                overlap_shared ? " routed+shared" : "", full_ms);
+    std::printf("  EP%d synchronized end-to-end: %.4f ms (%.2fx)\n",
+                world, total_ms, full_ms / total_ms);
     std::printf("  root physical=%d %-24s compute=%.4f ms\n",
-                root_device, root_properties.name, root_compute_ms);
-    std::printf("  peer physical=%d %-24s compute=%.4f ms\n",
-                peer_device, handles.name, peer_compute_ms);
-    std::printf("  stages: trigger=%.4f ms root_compute=%.4f ms "
+                devices[0], root_properties.name, root_compute_ms);
+    for (int i = 0; i < peers; i++)
+        std::printf("  peer physical=%d %-24s compute=%.4f ms\n",
+                    devices[i + 1], handles[(size_t)i].name,
+                    peer_compute_ms[(size_t)i]);
+    std::printf("  stages: broadcast=%.4f ms trigger=%.4f ms root_compute=%.4f ms "
                 "residual_wait=%.4f ms collective=%.4f ms\n",
-                trigger_ms, root_compute_ms, wait_ms, collective_ms);
+                broadcast_ms, trigger_ms, root_compute_ms, wait_ms,
+                collective_ms);
     std::printf("  numerical: rms=%g max_abs=%g max_ref=%g rel=%g\n",
                 rms, max_abs, max_ref, rel);
     std::printf("  verification: %s\n", pass ? "PASS" : "FAIL");
 
+    ds4_rocm_tp_star_destroy(broadcast_star);
     ds4_rocm_tp_star_destroy(star);
+    ds4_gpu_tensor_free(broadcast_copy);
+    ds4_gpu_tensor_free(reference_shared);
+    ds4_gpu_tensor_free(reference_routed);
     ds4_gpu_tensor_free(reference);
     free_buffers(&buffers);
     ds4_gpu_cleanup();

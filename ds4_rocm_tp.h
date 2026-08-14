@@ -40,6 +40,15 @@ ds4_rocm_tp_star *ds4_rocm_tp_star_create(
 int ds4_rocm_tp_star_allreduce_f32(ds4_rocm_tp_star *star,
                                    uint64_t count,
                                    int synchronize);
+/* Sum every rank's input into the root output only.  This is the preferred
+ * operation when the layer-owning rank alone consumes the reduced tensor. */
+int ds4_rocm_tp_star_reduce_f32(ds4_rocm_tp_star *star,
+                               uint64_t count,
+                               int synchronize);
+/* Copy the root input to every rank's output allocation. */
+int ds4_rocm_tp_star_broadcast_f32(ds4_rocm_tp_star *star,
+                                  uint64_t count,
+                                  int synchronize);
 int ds4_rocm_tp_star_synchronize(ds4_rocm_tp_star *star);
 void ds4_rocm_tp_star_destroy(ds4_rocm_tp_star *star);
 

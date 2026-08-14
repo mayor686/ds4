@@ -204,6 +204,18 @@ int main(int argc, char **argv) {
         std::chrono::duration<double>(end - begin).count() * 1.0e6 /
         serial_iters;
 
+    for (int i = 0; i < 20; i++) {
+        if (!ds4_rocm_tp_star_broadcast_f32(star, hidden_count, 1)) return 14;
+    }
+    begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < serial_iters; i++) {
+        if (!ds4_rocm_tp_star_broadcast_f32(star, hidden_count, 1)) return 14;
+    }
+    end = std::chrono::steady_clock::now();
+    const double broadcast_us =
+        std::chrono::duration<double>(end - begin).count() * 1.0e6 /
+        serial_iters;
+
     if (!ds4_rocm_tp_star_allreduce_f32(star, verify_count, 1)) return 14;
     std::vector<float> root_host(verify_count);
     if (hipMemcpy(root_host.data(), root_output, kVerifyBytes,
@@ -211,8 +223,9 @@ int main(int argc, char **argv) {
     size_t root_wrong = 0;
     for (float value : root_host) root_wrong += value != expected;
     std::printf("HIP IPC star world=%d root=%d payload=%zuKiB "
-                "queued=%.2fus serialized=%.2fus\n",
-                world, devices[0], kHiddenBytes >> 10, queued_us, serial_us);
+                "queued=%.2fus serialized=%.2fus broadcast=%.2fus\n",
+                world, devices[0], kHiddenBytes >> 10, queued_us, serial_us,
+                broadcast_us);
     std::printf("root checked=%zu wrong=%zu expected=%.1f\n",
                 verify_count, root_wrong, expected);
 
