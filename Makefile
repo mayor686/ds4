@@ -482,6 +482,12 @@ tests/rocm_tp_q8_output_ipc_e2e.o: tests/rocm_tp_q8_output_ipc_e2e.cu ds4_gpu.h 
 tests/rocm_tp_q8_output_ipc_e2e: tests/rocm_tp_q8_output_ipc_e2e.o ds4_rocm.o ds4_rocm_tp.o
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
+tests/rocm_hc_norm_mix_bench.o: tests/rocm_hc_norm_mix_bench.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -I. -c -o $@ $<
+
+tests/rocm_hc_norm_mix_bench: tests/rocm_hc_norm_mix_bench.o ds4_rocm.o
+	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
 tests/rocm_ep_iq2_q2_ipc_e2e.o: tests/rocm_ep_iq2_q2_ipc_e2e.cu ds4_gpu.h ds4_rocm_tp.h
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -I. -c -o $@ $<
 

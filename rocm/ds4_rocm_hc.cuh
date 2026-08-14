@@ -3,6 +3,65 @@
 // Included from ds4_cuda.cu in the same translation unit to preserve current
 // static helper visibility and launch behavior.
 
+/* Decode HC producer: fuse the 16384-wide unweighted RMS normalization with
+ * its 24-row F16 mixer.  The standalone decode path uses a 256-thread binary
+ * tree for RMSNorm followed by the 32-thread ordered-chunks matvec.  Each
+ * block below reproduces that RMS tree and one mixer row.  Using one block
+ * per output row gives gfx906 enough independent work to spread the narrow
+ * projection across its CUs; the contiguous 512-element chunks and final
+ * lane order stay identical to the standalone projection. */
+__global__ static void hc_rms_norm_mix_f16_ordered_kernel(
+        float *out,
+        const float *x,
+        const __half *weight,
+        uint32_t n,
+        uint32_t out_dim,
+        float eps) {
+    __shared__ float norm_partial[256];
+    __shared__ float mix_partial[32];
+
+    const uint32_t tid = threadIdx.x;
+    float norm_sum = 0.0f;
+    for (uint32_t i = tid; i < n; i += blockDim.x) {
+        const float v = x[i];
+        norm_sum += v * v;
+    }
+    norm_partial[tid] = norm_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            norm_partial[tid] += norm_partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(norm_partial[0] / (float)n + eps);
+
+    const uint32_t lane = tid & 31u;
+    const uint32_t row = blockIdx.x;
+    if (tid < 32u && row < out_dim) {
+        const uint32_t chunk = (n + 31u) / 32u;
+        const uint32_t k0 = lane * chunk;
+        uint32_t k1 = k0 + chunk;
+        if (k1 > n) k1 = n;
+        float sum = 0.0f;
+        const __half *wr = weight + (uint64_t)row * n;
+        for (uint32_t i = k0; i < k1; ++i) {
+            const float xv = x[i] * scale;
+            sum += __half2float(wr[i]) * xv;
+        }
+        mix_partial[lane] = sum;
+    }
+    __syncthreads();
+
+    if (tid == 0u && row < out_dim) {
+        float total = 0.0f;
+        for (uint32_t i = 0; i < 32u; ++i) {
+            total += mix_partial[i];
+        }
+        out[row] = total;
+    }
+}
+
 __device__ static void hc4_split_one(float *out, const float *mix, const float *scale, const float *base, uint32_t sinkhorn_iters, float epsv) {
     const float pre_scale = scale[0];
     const float post_scale = scale[1];

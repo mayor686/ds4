@@ -1354,3 +1354,47 @@ non esiste una singola fase non ancora ottimizzata abbastanza grande da offrire
 un salto analogo al +21% ottenuto dalla transpose attention a contesto lungo.
 Il margine realistico dei prossimi kernel e' incrementale e va sommato su 43
 layer; l'output head, eseguito una volta, non e' un obiettivo prioritario.
+
+### Fusione ROCm RMSNorm + mixer hyper-connection
+
+I due blocchi HC pre-layer eseguivano ciascuno una RMSNorm non pesata larga
+16.384 e una proiezione F16 stretta `16384 -> 24` in due dispatch. Il nuovo
+kernel ROCm riproduce la riduzione RMS a 256 thread e la proiezione
+`ordered-chunks` a 32 thread nello stesso blocco. Su gfx906 una riga di output
+per blocco e' risultata nettamente migliore di 2, 4 o 8 righe: i 24 blocchi
+indipendenti distribuiscono il matvec stretto su piu' CU.
+
+Il micro-gate confronta direttamente il percorso separato con quello fuso:
+
+| HC `16384 -> 24`, singola GPU | Tempo | Verifica |
+|---|---:|---:|
+| RMSNorm + F16 separati | 0,1359 ms | riferimento |
+| Kernel fuso ROCm | **0,1181 ms** | **0/192 mismatch, max ULP 0** |
+| Riduzione | **0,0178 ms, 1,15x** | bit-exact su 8 pattern |
+
+Nel profilo del layer 20 la fase HC pre-attention scende da circa 0,162 a
+0,147 ms e HC pre-FFN da 0,159 a 0,141 ms. Il piccolo risparmio si ripete due
+volte per ciascuno dei 43 layer e diventa misurabile end-to-end:
+
+| Gate PP6 | Baseline | HC fuso | Delta decode |
+|---|---:|---:|---:|
+| 1K / 256, stessa sequenza token | 14,89 tok/s | **15,15-15,16 tok/s** | **+1,8%** |
+| 8K / 256 | 13,34 tok/s | **13,61 tok/s** | **+2,0%** |
+| Prefill 8K | 197,19 tok/s | 197,47 tok/s | +0,1%, rumore |
+
+Il gate 1K esclude un run baseline corrotto che aveva prodotto 256 token zero.
+Nel gate 8K entrambe le sequenze hanno 256/256 token non nulli ma divergono al
+token 12, entro la nondeterministicita' greedy preesistente del backend; il
+confronto aritmetico isolato del nuovo kernel rimane bit-identico. La fusione e'
+abilitata di default su ROCm gfx906 per la sola forma DeepSeek `16384 -> 24`; il
+rollback e' `DS4_ROCM_DISABLE_HC_NORM_MIX_FUSE=1`.
+
+Risultati riproducibili:
+
+- micro-gate: `tests/rocm_hc_norm_mix_bench`;
+- profilo fuso: `.ds4-benchmarks/gfx906-0731/20260814-124812-graph`;
+- 1K fuso: `20260814-124659-decode-eager` e
+  `20260814-124901-decode-eager`; baseline corrispondente:
+  `20260814-125311-decode-eager`;
+- 8K: `20260814-125423-chunk256` fuso e
+  `20260814-125555-chunk256` baseline.

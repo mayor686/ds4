@@ -22145,9 +22145,13 @@ static bool metal_graph_encode_decode_layer_phase(
             hc_dim == 16384u && mix_hc == 24u &&
             layer->hc_attn_fn->type == DS4_TENSOR_F16 &&
             !metal_graph_use_reference_hc_decode() &&
+#if defined(DS4_ROCM_BUILD)
+            getenv("DS4_ROCM_DISABLE_HC_NORM_MIX_FUSE") == NULL &&
+#else
             getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              ds4_gpu_device_is_m5_apple_silicon()) &&
+#endif
             ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
 #if defined(__APPLE__)
         const bool fuse_producer_pre_norm =
@@ -23763,9 +23767,13 @@ static bool metal_graph_encode_decode_layer_phase(
             hc_dim == 16384u && mix_hc == 24u &&
             layer->hc_ffn_fn->type == DS4_TENSOR_F16 &&
             !metal_graph_use_reference_hc_decode() &&
+#if defined(DS4_ROCM_BUILD)
+            getenv("DS4_ROCM_DISABLE_HC_NORM_MIX_FUSE") == NULL &&
+#else
             getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              ds4_gpu_device_is_m5_apple_silicon()) &&
+#endif
             ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
 #if defined(__APPLE__)
         const bool fuse_producer_pre_norm =

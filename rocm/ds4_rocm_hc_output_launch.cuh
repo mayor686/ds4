@@ -24,6 +24,45 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
 }
 
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_available(void) {
+#if defined(DS4_GFX906)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              out_dim,
+        float                 eps) {
+    if (!out || !x || !model_map || n != 16384u || out_dim != 24u ||
+        !cuda_tensor_has_f32(x, n) || !cuda_tensor_has_f32(out, out_dim)) {
+        return 0;
+    }
+    uint64_t weight_bytes = 0;
+    if (!cuda_u64_mul3_checked(out_dim, n, sizeof(uint16_t), &weight_bytes) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "HC norm/mix f16");
+    if (!wptr) return 0;
+    hc_rms_norm_mix_f16_ordered_kernel<<<out_dim, 256>>>(
+        (float *)out->ptr,
+        (const float *)x->ptr,
+        (const __half *)wptr,
+        n,
+        out_dim,
+        eps);
+    return cuda_ok(cudaGetLastError(), "HC norm/mix f16 launch");
+}
+
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
