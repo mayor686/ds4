@@ -1331,3 +1331,26 @@ mappe fisiche sono ora esclusi da misure E2E. Il prossimo candidato deve quindi
 superare prima un micro-gate di almeno 5% sulla fase interessata e poi il gate
 PP6 8K/256 con token non nulli; guadagni inferiori a circa 0,5 ms/token non sono
 distinguibili in modo affidabile dal rumore e non vanno portati in produzione.
+
+Il profiler ora inserisce un confine anche prima della prima fase del layer e
+dell'output head; in precedenza la prima voce assorbiva il lavoro pendente del
+layer precedente. Sul layer 20 a frontiera 1K il totale attribuito e' 1,597 ms:
+
+| Fase decode/layer | Tempo | Quota |
+|---|---:|---:|
+| Routed-MoE | 0,258 ms | 16,2% |
+| Attention indexed + inverse RoPE | 0,256 ms | 16,0% |
+| Proiezione attention output | 0,179 ms | 11,2% |
+| Hyper-connection pre-attention | 0,162 ms | 10,2% |
+| Hyper-connection pre-FFN | 0,159 ms | 10,0% |
+| Quattro proiezioni compressori F16 | 0,154 ms | 9,6% |
+| Q path | 0,119 ms | 7,4% |
+| Router | 0,087 ms | 5,4% |
+| Resto | 0,222 ms | 13,9% |
+
+L'output head separato misura 1,268 ms: proiezione Q8 1,046 ms, HC pre 0,105
+ms e tutte le altre operazioni 0,117 ms. Questo profilo corretto conferma che
+non esiste una singola fase non ancora ottimizzata abbastanza grande da offrire
+un salto analogo al +21% ottenuto dalla transpose attention a contesto lungo.
+Il margine realistico dei prossimi kernel e' incrementale e va sommato su 43
+layer; l'output head, eseguito una volta, non e' un obiettivo prioritario.

@@ -21981,6 +21981,11 @@ static bool metal_graph_encode_decode_layer_phase(
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
+    if (decode_stage_profile &&
+        !metal_graph_layer_stage_profile_boundary(
+            "decode", NULL, il, pos, 1, &decode_stage_t0)) {
+        return false;
+    }
     const bool fuse_shared_gate_up =
         !g->quality &&
         g->tp_world < 2 &&
@@ -25269,6 +25274,11 @@ static bool metal_graph_encode_output_head(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const bool output_stage_profile = g->output_stage_profile;
     double output_stage_t0 = output_stage_profile ? now_sec() : 0.0;
+    if (output_stage_profile &&
+        !metal_graph_layer_stage_profile_boundary(
+            "output", NULL, DS4_N_LAYER, 0, 1, &output_stage_t0)) {
+        return false;
+    }
 #define DS4_METAL_PROFILE_OUTPUT_STAGE(name) do { \
         if (ok && output_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("output", (name), DS4_N_LAYER, 0, 1, &output_stage_t0); \
