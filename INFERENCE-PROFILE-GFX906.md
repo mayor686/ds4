@@ -1073,3 +1073,30 @@ Risultati riproducibili:
   `.ds4-benchmarks/gfx906-0731/20260813-082038-graph`;
 - verifica finale token/profilo:
   `.ds4-benchmarks/gfx906-0731/20260813-113942-graph`.
+
+## Gate DeepSeek autoregressivo del 14 agosto 2026
+
+Tre candidati gfx906 superavano i microbenchmark isolati: split IQ2 gate/up,
+weighted-V indexed con 512 thread e workgroup Q8 verso hyper-connection da
+otto righe. Il primo A/B PP6 combinato misurava apparentemente 13,76 token/s
+contro 13,36 token/s, ma la generazione greedy divergeva al token 17. Il dato
+di velocita' e' stato quindi scartato e ogni candidato e' stato isolato sul
+modello DeepSeek-V4-Flash reale.
+
+| Candidato isolato, 8K | Esito autoregressivo |
+|---|---|
+| IQ2 gate/up split | diverge al token 17 |
+| weighted-V indexed 512 | output token `0` dal primo passo |
+| Q8 -> HC, 8 righe | 32 token identici, ma 256 token degenerano in `0` |
+
+Tutti e tre i commit sono stati revertiti. La ricostruzione finale passa
+`make gfx906 -j16` e l'intera `make rocm-regression ROCM_ARCH=gfx906`; il gate
+PP6 8K/256 produce 256/256 token identici al riferimento. Le prestazioni finali
+sono 197,14 token/s in prefill e 13,30 token/s in decode, contro rispettivamente
+197,21 e 13,36 del riferimento: la differenza e' rumore di misura.
+
+Il launcher include ora `decode-verify` (1K/32 token) e `decode-verify8k`
+(8K/32 token) per i bisect rapidi. L'accettazione definitiva di un nuovo
+default richiede comunque il gate `window6` completo da 8K/256 token, perche'
+il candidato Q8 -> HC ha dimostrato che 32 token possono non esporre una
+corruzione tardiva.

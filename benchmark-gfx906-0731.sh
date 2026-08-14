@@ -19,6 +19,8 @@
 #   ./benchmark-gfx906-0731.sh moe-rpbN  # chunk 256, MoE decode rows/block N
 #   ./benchmark-gfx906-0731.sh q8-rpbN   # chunk 256, Q8 decode rows/block N
 #   ./benchmark-gfx906-0731.sh decode-base # short-frontier decode reference
+#   ./benchmark-gfx906-0731.sh decode-verify # 32-token correctness/perf probe
+#   ./benchmark-gfx906-0731.sh decode-verify8k # long-attention correctness probe
 #   ./benchmark-gfx906-0731.sh decode-graph # gfx906 HIP graph capture + logging
 #   ./benchmark-gfx906-0731.sh decode-eager # disable HIP graphs for A/B comparison
 #   ./benchmark-gfx906-0731.sh decode-rpb8 # combined gfx906 rows/block candidate
@@ -121,6 +123,16 @@ case "${MODE}" in
             RUNTIME_ENV+=("DS4_ROCM_ATTN_COMP_CACHE_F16=0")
         fi
         ;;
+    decode-verify)
+        PREFILL_CHUNK=256
+        FRONTIER=1024
+        GEN_TOKENS=32
+        ;;
+    decode-verify8k)
+        PREFILL_CHUNK=256
+        FRONTIER=8192
+        GEN_TOKENS=32
+        ;;
     decode-graph)
         PREFILL_CHUNK=256
         FRONTIER=1024
@@ -219,7 +231,7 @@ case "${MODE}" in
         BENCH_EXTRA_ARGS+=("--repeat-prompt")
         ;;
     *)
-        echo "usage: $0 [all|baseline|dspark|tuned|forced|verify|verify-tuned|tune|graph|chunk128|chunk256|swap14|optimized|window{3,6,8}|decode-base|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb{1,2,4,8}|q8-rpb{1,2,4,8}|moe-profile|no-moe-wmma|legacy-moe-wmma|logits|logits-f16|logits-f32|logits-porting|logits-speedup|dspark256|dspark-long|dspark-context{16k,16k-only,32k,32k-only,64k,64k-only}|long16k|long16k-f16|long16k-f32|long64k|long64k-700|long300k]" >&2
+        echo "usage: $0 [all|baseline|dspark|tuned|forced|verify|verify-tuned|tune|graph|chunk128|chunk256|swap14|optimized|window{3,6,8}|decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb{1,2,4,8}|q8-rpb{1,2,4,8}|moe-profile|no-moe-wmma|legacy-moe-wmma|logits|logits-f16|logits-f32|logits-porting|logits-speedup|dspark256|dspark-long|dspark-context{16k,16k-only,32k,32k-only,64k,64k-only}|long16k|long16k-f16|long16k-f32|long64k|long64k-700|long300k]" >&2
         exit 2
         ;;
 esac
@@ -320,7 +332,7 @@ run_case() {
         start_worker "${case_name}" "${port}" "${device}" "${layers}"
     done
     case "${case_name}" in
-        baseline|graph|chunk128|chunk256|swap14|optimized|window*|decode-base|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb*|q8-rpb*|moe-profile|no-moe-wmma|legacy-moe-wmma|long*) ;;
+        baseline|graph|chunk128|chunk256|swap14|optimized|window*|decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb*|q8-rpb*|moe-profile|no-moe-wmma|legacy-moe-wmma|long*) ;;
         *)
             final_args=(--mtp "${DSPARK}" --dspark --dspark-confidence "${confidence}")
             bench_args=(--mtp "${DSPARK}" --dspark --dspark-confidence "${confidence}")
@@ -486,7 +498,7 @@ case "${MODE}" in
     q8-rpb1|q8-rpb2|q8-rpb4|q8-rpb8)
         run_case "${MODE}" 19248 0 0
         ;;
-    decode-base|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-profile)
+    decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-profile)
         run_case "${MODE}" 19251 0 0
         ;;
     no-moe-wmma)

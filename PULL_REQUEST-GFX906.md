@@ -171,6 +171,13 @@ tokens at 13.5 token/s.  The unmodified generated source passed Python compile
 and functional tests for add/list/done/stats/remove, stable IDs, JSON output,
 invalid IDs, corrupt databases, invalid priorities, and atomic-save cleanup.
 
+Later gfx906 experiments with split IQ2 gate/up, a 512-thread indexed
+weighted-V phase, and smaller Q8-to-hyper-connection workgroups passed isolated
+kernel checks but failed the real 8K greedy-generation gate. They are not part
+of the final implementation. The post-revert PP6 build reproduces all 256
+reference token IDs; `decode-verify` and `decode-verify8k` remain as fast bisect
+modes, while `window6` 8K/256 is the required final acceptance run.
+
 Live tool-continuation regression testing used a 300,000-token resident server
 and real SSE assembly. An 18-call `read` response generated 751 DSML tokens;
 the continuation changed only the JSON key order of an otherwise identical
