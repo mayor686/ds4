@@ -43,6 +43,7 @@
 #   ./benchmark-gfx906-0731.sh long64k-700 # same frontier with production 700K allocation
 #   ./benchmark-gfx906-0731.sh long16k   # 16K prefill frontier, short decode
 #   ./benchmark-gfx906-0731.sh long300k  # 300K prefill frontier, short decode
+#   ./benchmark-gfx906-0731.sh fullcontext # 699,998-token prefill in the production 700K context
 #
 # For an isolated A/B build, override the binary/source root and keep its
 # results separate, for example:
@@ -235,8 +236,15 @@ case "${MODE}" in
         GEN_TOKENS=16
         BENCH_EXTRA_ARGS+=("--repeat-prompt")
         ;;
+    fullcontext)
+        CTX_ALLOC=700000
+        PREFILL_CHUNK=256
+        FRONTIER=699998
+        GEN_TOKENS=1
+        BENCH_EXTRA_ARGS+=("--repeat-prompt")
+        ;;
     *)
-        echo "usage: $0 [all|baseline|dspark|tuned|forced|verify|verify-tuned|tune|graph|chunk128|chunk256|swap14|optimized|window{3,6,8}|decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb{1,2,4,8}|q8-rpb{1,2,4,8}|moe-profile|no-moe-wmma|legacy-moe-wmma|logits|logits-f16|logits-f32|logits-porting|logits-speedup|dspark256|dspark-long|dspark-context{16k,16k-only,32k,32k-only,64k,64k-only}|long16k|long16k-f16|long16k-f32|long64k|long64k-700|long300k]" >&2
+        echo "usage: $0 [all|baseline|dspark|tuned|forced|verify|verify-tuned|tune|graph|chunk128|chunk256|swap14|optimized|window{3,6,8}|decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb{1,2,4,8}|q8-rpb{1,2,4,8}|moe-profile|no-moe-wmma|legacy-moe-wmma|logits|logits-f16|logits-f32|logits-porting|logits-speedup|dspark256|dspark-long|dspark-context{16k,16k-only,32k,32k-only,64k,64k-only}|long16k|long16k-f16|long16k-f32|long64k|long64k-700|long300k|fullcontext]" >&2
         exit 2
         ;;
 esac
@@ -337,7 +345,7 @@ run_case() {
         start_worker "${case_name}" "${port}" "${device}" "${layers}"
     done
     case "${case_name}" in
-        baseline|graph|chunk128|chunk256|swap14|optimized|window*|decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb*|q8-rpb*|moe-profile|no-moe-wmma|legacy-moe-wmma|long*) ;;
+        baseline|graph|chunk128|chunk256|swap14|optimized|window*|decode-base|decode-verify|decode-verify8k|decode-f16|decode-f32|decode-graph|decode-eager|decode-rpb8|moe-rpb*|q8-rpb*|moe-profile|no-moe-wmma|legacy-moe-wmma|long*|fullcontext) ;;
         *)
             final_args=(--mtp "${DSPARK}" --dspark --dspark-confidence "${confidence}")
             bench_args=(--mtp "${DSPARK}" --dspark --dspark-confidence "${confidence}")
@@ -548,7 +556,7 @@ case "${MODE}" in
         wait_for_gpu_cooldown 75000 900
         run_case dspark 19259 "${DSPARK_CONFIDENCE}" 1
         ;;
-    long16k|long16k-f16|long16k-f32|long64k|long64k-700|long300k)
+    long16k|long16k-f16|long16k-f32|long64k|long64k-700|long300k|fullcontext)
         run_case "${MODE}" 19250 0 0
         ;;
 esac
