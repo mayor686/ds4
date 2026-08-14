@@ -1073,27 +1073,3 @@ Risultati riproducibili:
   `.ds4-benchmarks/gfx906-0731/20260813-082038-graph`;
 - verifica finale token/profilo:
   `.ds4-benchmarks/gfx906-0731/20260813-113942-graph`.
-
-### Workgroup Q8 verso hyper-connection
-
-La proiezione Q8 `8192 -> 7168` che chiude l'attention output fonde anche
-l'espansione delle quattro hyper-connection DeepSeek. Su gfx906 il workgroup
-precedente raggruppava 16 righe logiche wave32; otto righe espongono il doppio
-dei blocchi indipendenti ai 60 CU senza cambiare l'assegnazione o l'ordine di
-riduzione di alcuna riga.
-
-Il microbenchmark usa le forme reali DeepSeek-V4 (`group_dim=4096`, otto gruppi,
-rank 1024, hidden 7168 e quattro hyper-connection) e confronta esecuzioni
-alternate nello stesso binario:
-
-| Q8 -> HC, 500 iterazioni | 16 righe | 8 righe | Variazione |
-|---|---:|---:|---:|
-| Replica A | 5,0315 ms | 4,8579 ms | **-3,5%** |
-| Replica B | 4,9599 ms | 4,8188 ms | **-2,8%** |
-
-Entrambe le configurazioni producono gli stessi hash bit per bit sia per il
-low-rank output (`19f7bf1922668b60`) sia dopo l'espansione HC
-(`92afe65c7534e5eb`). Otto righe sono il nuovo default soltanto su gfx906;
-`DS4_ROCM_Q8_HC_DECODE_RPB=16` ripristina il workgroup precedente. Il benchmark
-si ricostruisce con
-`make tests/rocm_gfx906_dense_decode_bench ROCM_ARCH=gfx906`.

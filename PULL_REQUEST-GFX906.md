@@ -118,8 +118,6 @@ modes for the same arithmetic prompt.
   while preserving each output row's reduction order.
 - Transpose only the selected indexed-attention K rows for coalesced Q·K reads,
   retaining the original V layout and FP32 accumulation order.
-- Use eight logical rows per gfx906 Q8-to-hyper-connection workgroup to expose
-  more independent blocks to Vega 20's 60 CUs without changing row reductions.
 - Fuse indexed-attention inverse RoPE into the final attention workgroup; the
   ROCm regression verifies bit-identical output against the separate kernel.
 - Make the ROCm weight-arena chunk configurable.
@@ -156,7 +154,6 @@ ROCR_VISIBLE_DEVICES=2 make rocm-regression \
   Q8 wave64 packing: 4097 rows, 0 mismatches        PASS
   F16-pair sizing: 513 rows, 0 mismatches           PASS
   F16 compressor quad: max_abs=0, 0 mismatches      PASS
-  Q8-to-HC workgroup: hashes bit-exact, -2.8/-3.5%  PASS
   router wave64: 256/384 experts, 0 mismatches      PASS
 ./ds4_test --server                                  PASS
 ASan + UBSan focused schema/tool-replay tests        PASS

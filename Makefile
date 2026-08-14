@@ -461,12 +461,6 @@ tests/rocm_tp_q8_projection.o: tests/rocm_tp_q8_projection.cu ds4_gpu.h
 tests/rocm_tp_q8_projection: tests/rocm_tp_q8_projection.o ds4_rocm.o
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-tests/rocm_gfx906_dense_decode_bench.o: tests/rocm_gfx906_dense_decode_bench.cu ds4_gpu.h
-	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -I. -c -o $@ $<
-
-tests/rocm_gfx906_dense_decode_bench: tests/rocm_gfx906_dense_decode_bench.o ds4_rocm.o
-	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -o $@ $^ $(ROCM_LDLIBS)
-
 ds4_rocm_tp.o: ds4_rocm_tp.cu ds4_rocm_tp.h
 	$(HIPCC) $(ROCM_CFLAGS) $(ROCM_CPPFLAGS) -c -o $@ $<
 
@@ -553,5 +547,5 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f tests/rocm_tp_q8_projection tests/rocm_tp_ipc_star tests/rocm_tp_q8_ipc_e2e tests/rocm_ep_iq2_q2_ipc_e2e tests/rocm_gfx906_dense_decode_bench
+	rm -f tests/rocm_tp_q8_projection tests/rocm_tp_ipc_star tests/rocm_tp_q8_ipc_e2e tests/rocm_ep_iq2_q2_ipc_e2e
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/rocm_long_context_smoke tests/gfx906_wmma_test tests/cuda_long_context_smoke.o

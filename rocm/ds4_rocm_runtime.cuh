@@ -4952,15 +4952,7 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.f16_pair_decode_rpb =
             cuda_rows_per_block_env_or_default("DS4_ROCM_F16_PAIR_DECODE_RPB",
                                                f16_pair_default);
-        uint32_t q8_hc_decode_default = g_quality_mode ? 8u : 16u;
-#if defined(DS4_GFX906)
-        /* Eight logical wave32 rows expose enough blocks to fill Vega 20's
-         * 60 CUs without changing any row's dot-product reduction. */
-        if (!g_quality_mode) q8_hc_decode_default = 8u;
-#endif
-        g_rocm_cfg.q8_hc_decode_rpb =
-            cuda_rows_per_block_env_or_default("DS4_ROCM_Q8_HC_DECODE_RPB",
-                                               q8_hc_decode_default);
+        g_rocm_cfg.q8_hc_decode_rpb = g_quality_mode ? 8u : 16u;
         g_rocm_cfg.attn_out_low_decode_rpb = g_quality_mode ? 8u : 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
